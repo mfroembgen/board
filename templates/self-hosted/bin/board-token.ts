@@ -180,7 +180,14 @@ async function login(saved: Saved | null): Promise<Saved> {
       const page = ok ? 'Signed in to the board. You can close this tab.' : 'Sign-in failed.'
       response.writeHead(ok ? 200 : 400, { 'content-type': 'text/plain', connection: 'close' }).end(page)
       clearTimeout(timer)
-      ok ? resolve(url.searchParams.get('code')!) : reject(new Error(url.searchParams.get('error_description') ?? 'sign-in failed'))
+      if (ok) return resolve(url.searchParams.get('code')!)
+      const error = url.searchParams.get('error')
+      const hint = error === 'invalid_target' ? `: register ${BOARD} as a resource indicator in AuthKit` : ''
+      const why =
+        url.searchParams.get('state') !== state ? 'the callback belongs to another sign-in (state mismatch)'
+        : url.searchParams.get('iss') !== ISSUER ? `the callback names issuer ${url.searchParams.get('iss') ?? '(none)'}, not ${ISSUER}`
+        : `${url.searchParams.get('error_description') ?? error ?? 'no code in the callback'}${hint}`
+      reject(new Error(`sign-in failed: ${why}`))
     })
   }).finally(() => server.close())
 
