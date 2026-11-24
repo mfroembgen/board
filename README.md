@@ -168,6 +168,7 @@ people open the board at your deployment's URL, from any browser, phone included
 | --- | --- |
 | [factory](./templates/factory) | An agent on your team's board that takes bugs, features, and questions to pull requests, with GitHub and Slack synced in |
 | [swarm](./templates/swarm) | Many agents working one queue of tasks on a board, and a live page to watch them |
+| [self-hosted](./templates/self-hosted) | A board on your own server: SQLite on one disk, people through WorkOS AuthKit, machines through OIDC grants, with an image and a Helm chart |
 
 ## A board of your own
 

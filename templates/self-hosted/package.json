@@ -1,0 +1,24 @@
+{
+  "name": "self-hosted",
+  "version": "0.56.1",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.23.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@vercel/board": "0.56.1",
+    "jose": "6.2.18",
+    "srvx": "1.0.8"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}

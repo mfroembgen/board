@@ -1,0 +1,6 @@
+apiVersion: v2
+name: board
+description: A self-hosted @vercel/board, for people (WorkOS AuthKit) and machines (OIDC grants)
+type: application
+version: 0.56.1
+appVersion: "0.56.1"

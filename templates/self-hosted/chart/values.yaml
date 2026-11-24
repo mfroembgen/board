@@ -1,0 +1,33 @@
+image:
+  repository: ghcr.io/mfroembgen/board
+  tag: "0.56.1"
+  pullPolicy: IfNotPresent
+
+# Required: the host the board is served on, at https://<host>/api/board.
+host: ""
+# Required: the WorkOS AuthKit origin people sign in with, https://<tenant>.authkit.app.
+authkitIssuer: ""
+# Required: the email domain people must have verified.
+teamDomain: ""
+
+ingress:
+  enabled: true
+  className: ""
+  annotations: {}
+
+storage:
+  className: ""
+  size: 5Gi
+  annotations: {}
+
+# Extra metadata, for a cluster's own controllers.
+deploymentAnnotations: {}
+podAnnotations: {}
+podLabels: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
