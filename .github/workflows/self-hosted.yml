@@ -1,0 +1,163 @@
+name: Self-hosted board
+
+on:
+  pull_request:
+    paths:
+      - templates/self-hosted/**
+      - .github/workflows/self-hosted.yml
+  push:
+    branches: [main]
+    paths:
+      - templates/self-hosted/**
+      - .github/workflows/self-hosted.yml
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the image and chart after all checks pass
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: templates/self-hosted
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.3
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+      - name: Check release versions
+        id: version
+        run: |
+          node --input-type=module >> "$GITHUB_OUTPUT" <<'EOF'
+            import { readFileSync } from "node:fs"
+            const pkg = JSON.parse(readFileSync("package.json", "utf8"))
+            const field = (file, key) => readFileSync(file, "utf8").match(new RegExp(`^${key}: "?([^"\\n]+)"?$`, "m"))?.[1]
+            const tag = readFileSync("chart/values.yaml", "utf8").match(/^  tag: "([^"]+)"$/m)?.[1]
+            const released = readFileSync("pnpm-workspace.yaml", "utf8").match(/'@vercel\/board@([^']+)'/)?.[1]
+            const versions = [pkg.version, pkg.dependencies["@vercel/board"], released, field("chart/Chart.yaml", "version"), field("chart/Chart.yaml", "appVersion"), tag]
+            if (!/^\d+\.\d+\.\d+$/.test(pkg.version) || new Set(versions).size !== 1)
+              throw new Error(`template, @vercel/board, its release-age exclusion, chart and image versions must match: ${versions.join(", ")}`)
+            console.log(`version=${pkg.version}`)
+          EOF
+      - run: corepack enable && pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - name: Lint the chart
+        run: |
+          set -- --set host=board.example.com,authkitIssuer=https://tenant.authkit.app,teamDomain=example.com
+          helm lint --strict chart "$@"
+          helm template board chart "$@" > /tmp/board.yaml
+      - name: Smoke-test the image on a read-only root
+        run: |
+          docker build --tag board:check .
+          trap 'docker logs board' EXIT
+          docker run -d --name board --read-only --tmpfs /tmp -v board-data:/data -p 127.0.0.1:8080:8080 \
+            -e BOARD_PUBLIC_URL=http://127.0.0.1:8080/api/board \
+            -e AUTHKIT_ISSUER=https://tenant.authkit.test -e TEAM_DOMAIN=example.com board:check
+          for _ in $(seq 30); do curl -fs http://127.0.0.1:8080/healthz && break; sleep 1; done
+          curl -fs http://127.0.0.1:8080/api/board | grep -F '"audience":"http://127.0.0.1:8080/api/board"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/board/channels)" = 401
+
+  release:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main' && github.repository == 'mfroembgen/board'
+    needs: verify
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: board-release-${{ needs.verify.outputs.version }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # The `if` above compares case-insensitively, so `refs/heads/Main` would pass it; this doesn't.
+      - name: Publish only from main
+        working-directory: .
+        run: test "$GITHUB_REF" = refs/heads/main
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+      - name: Verify upstream tag and release source
+        id: source
+        run: |
+          tag="@vercel/board@$VERSION"
+          git fetch --no-tags https://github.com/vercel/board.git "refs/tags/$tag"
+          upstream_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          test "$(git rev-parse "$tag^{commit}")" = "$upstream_sha"
+          git merge-base --is-ancestor "$upstream_sha" "$GITHUB_SHA"
+          test "$upstream_sha" != "$GITHUB_SHA"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag already exists; inspect its provenance before retrying" >&2
+            exit 1
+          fi
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require unused image and chart versions
+        run: |
+          for ref in "ghcr.io/mfroembgen/board:$VERSION" "ghcr.io/mfroembgen/charts/board:$VERSION"; do
+            if docker buildx imagetools inspect --raw "$ref" > /tmp/manifest.json 2> /tmp/manifest-error; then
+              echo "$ref already exists; inspect its provenance before retrying" >&2
+              exit 1
+            fi
+            # A version, or a whole package, that isn't there yet. Anything else, a denial included, stops here.
+            if ! grep -Eq "$ref: not found|manifest unknown|name unknown" /tmp/manifest-error; then
+              cat /tmp/manifest-error >&2
+              exit 1
+            fi
+          done
+      - name: Publish image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: templates/self-hosted
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/mfroembgen/board:${{ env.VERSION }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            REVISION=${{ github.sha }}
+          provenance: true
+          sbom: true
+      - name: Publish Helm chart
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io --username "$GHCR_USER" --password-stdin
+          helm package chart --destination /tmp/charts
+          helm push "/tmp/charts/board-$VERSION.tgz" oci://ghcr.io/mfroembgen/charts
+      - name: Draft the release
+        env:
+          UPSTREAM_SHA: ${{ steps.source.outputs.upstream_sha }}
+        run: |
+          printf '%s\n' \
+            "A self-hosted @vercel/board: image and Helm chart from templates/self-hosted." \
+            "" \
+            "Upstream tag: @vercel/board@$VERSION" \
+            "Upstream commit: $UPSTREAM_SHA" \
+            "Patched source commit: $GITHUB_SHA" \
+            "Image: ghcr.io/mfroembgen/board:$VERSION" \
+            "Helm chart: oci://ghcr.io/mfroembgen/charts/board, version $VERSION" \
+            "" \
+            "The Git tag points to the original upstream commit. The artifacts use the patched source commit recorded above." \
+            > /tmp/release-notes.md
+          gh release create "@vercel/board@$VERSION" --verify-tag --draft \
+            --title "Self-hosted board $VERSION" --notes-file /tmp/release-notes.md
