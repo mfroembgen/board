@@ -3,12 +3,17 @@ image:
   tag: "0.56.1"
   pullPolicy: IfNotPresent
 
-# Required: the host the board is served on, at https://<host>/api/board.
+# Required: the host the board is served on: its UI at https://<host>/, its API at https://<host>/api/board.
 host: ""
 # Required: the WorkOS AuthKit origin people sign in with, https://<tenant>.authkit.app.
 authkitIssuer: ""
 # Required: the email domain people must have verified.
 teamDomain: ""
+# Optional: a public AuthKit OAuth client (no secret) for the browser sign-in at https://<host>/, whose redirect URI is
+# https://<host>/sign-in/callback. Empty: the board registers one itself and keeps it on its volume.
+authkitClientId: ""
+# Optional: the sign-in button's text, such as "Sign in with Google". Empty: "Sign in".
+signInLabel: ""
 
 ingress:
   enabled: true

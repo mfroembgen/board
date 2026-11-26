@@ -59,6 +59,14 @@ spec:
               value: {{ required "authkitIssuer is required" .Values.authkitIssuer | quote }}
             - name: TEAM_DOMAIN
               value: {{ required "teamDomain is required" .Values.teamDomain | quote }}
+            {{- with .Values.authkitClientId }}
+            - name: AUTHKIT_CLIENT_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.signInLabel }}
+            - name: SIGN_IN_LABEL
+              value: {{ . | quote }}
+            {{- end }}
           volumeMounts:
             - name: data
               mountPath: /data

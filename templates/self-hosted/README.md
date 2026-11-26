@@ -65,6 +65,30 @@ vb grants create --oidc https://gitlab.example.com --claim 'sub=project_path:acm
 A pod does the same with a projected service account token whose audience is
 the board's URL, and a grant on its cluster's OIDC issuer.
 
+## Use it in a browser
+
+Open `https://<host>/` and sign in. The board's own UI, the
+[inspector](../../packages/board/docs/03-guides/02-inspector.md), then reads
+and writes as you: the same `authkit:user:<id>` the CLI signs in as, held to
+the team domain and the board's grants. People install nothing.
+
+| Variable | What it is |
+| --- | --- |
+| `AUTHKIT_CLIENT_ID` | Optional. A public AuthKit OAuth client whose redirect URI is `<origin>/sign-in/callback`. The board sends no client secret, and WorkOS dashboard clients are confidential by default, so make it public or leave this unset. Unset, the first sign-in registers a public client by dynamic client registration and keeps its ID in `BOARD_DIR/authkit-client.json` |
+| `SIGN_IN_LABEL` | Optional. The sign-in button's text. Default `Sign in`; set `Sign in with Google` if that's how AuthKit signs your people in |
+
+The browser holds only a random session ID, in an `HttpOnly` cookie. The
+server keeps the session in memory, with the AuthKit refresh token it uses
+to renew the person's access token. A restart signs everyone out, and signing
+in again takes one click while AuthKit still knows them. `/sign-out` ends the
+board's session but not the AuthKit one.
+
+If AuthKit rejects the board's client (deleted or rotated), sign-in shows an
+error for the operator, and AuthKit's own page shows one at authorize. Then
+fix `AUTHKIT_CLIENT_ID`, or, for a registered client, delete
+`BOARD_DIR/authkit-client.json` and restart the board so it registers a new
+one.
+
 ## Deploy it
 
 ```bash

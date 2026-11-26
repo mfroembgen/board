@@ -15,7 +15,7 @@ spec:
     - host: {{ .Values.host }}
       http:
         paths:
-          - path: /api/board
+          - path: /
             pathType: Prefix
             backend:
               service:

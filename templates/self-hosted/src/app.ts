@@ -3,6 +3,7 @@ import { board } from '@vercel/board'
 import { oidcTokens, type OidcTokensOptions } from '@vercel/board/access'
 import { local } from '@vercel/board/backend-local'
 import { decodeJwt } from 'jose'
+import { browser, type BrowserOptions } from './browser.ts'
 import { authkitPeople, type PeopleOptions } from './people.ts'
 
 export type AppOptions = {
@@ -13,6 +14,7 @@ export type AppOptions = {
   people: Omit<PeopleOptions, 'audience'>
   /** Keys for grant-named issuers, for tests. Default: each issuer's published JWKS. */
   machines?: OidcTokensOptions
+  browser?: Pick<BrowserOptions, 'clientId' | 'label'>
 }
 
 /**
@@ -48,7 +50,7 @@ function untilExpiry(request: Request, response: Response): Response {
 }
 
 export function createApp(options: AppOptions): (request: Request) => Promise<Response> {
-  const basePath = new URL(options.url).pathname
+  const basePath = new URL(options.url).pathname.replace(/\/+$/, '')
   const people = authkitPeople({ ...options.people, audience: options.url })
   // CI jobs and pods: OIDC tokens for the board's URL from an issuer a grant names, with what that grant gives.
   const machines = oidcTokens(options.machines)
@@ -59,10 +61,21 @@ export function createApp(options: AppOptions): (request: Request) => Promise<Re
     authenticate: async (request) => (await people(request)) ?? (await machines(request)),
   })
 
+  const serve = async (request: Request) => untilExpiry(request, await team.fetch(request))
+  const page = browser({
+    ...options.browser,
+    url: options.url,
+    issuer: options.people.issuer,
+    team,
+    serve,
+    dir: typeof options.dir === 'string' ? options.dir : null,
+    ...(options.people.fetch ? { fetch: options.people.fetch } : {}),
+  })
+
   return async (request) => {
     const { pathname } = new URL(request.url)
     if (pathname === '/healthz') return new Response('ok')
-    if (pathname === basePath || pathname.startsWith(`${basePath}/`)) return untilExpiry(request, await team.fetch(request))
-    return new Response('not found', { status: 404 })
+    if (pathname === basePath || pathname.startsWith(`${basePath}/`)) return serve(request)
+    return page(request)
   }
 }
