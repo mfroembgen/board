@@ -255,6 +255,13 @@ let sent: () => string | null = () => null
 /** How long the message text this run sends is, for a backend's refusal of it to say what to do instead. */
 let sentLength = 0
 
+const REPLACE_TOKEN: Record<string, Recovery[]> = {
+  [PASSED]: [{ instruction: 'Pass a token it accepts' }],
+  BOARD_TOKEN: [{ instruction: 'Pass a token it accepts in BOARD_TOKEN, or unset it' }],
+  BOARD_TOKEN_COMMAND: [{ instruction: 'Make BOARD_TOKEN_COMMAND print a token it accepts, or unset it' }],
+  'GitHub Actions OIDC': [{ instruction: 'Pass a token it accepts in BOARD_TOKEN' }],
+}
+
 /**
  * The help `words` ask for: a command's page when they name one (`read`, `sources read`), or with
  * none, every command. A word that names no command is unknown, as it is without `--help`.
@@ -1073,15 +1080,9 @@ function failureOf(error: unknown): Failure {
       'auth',
       'login_required',
       "The board didn't accept your credentials.",
-      // A token you passed is yours to replace, and so is BOARD_TOKEN: logging in changes nothing while either is the one
+      // A token you passed is yours to replace, and so are BOARD_TOKEN and its command's: logging in changes nothing while one is the one
       // sent, or a workflow's own, where there's no login.
-      sent() === PASSED
-        ? [{ instruction: 'Pass a token it accepts' }]
-        : sent() === 'BOARD_TOKEN'
-          ? [{ instruction: 'Pass a token it accepts in BOARD_TOKEN, or unset it' }]
-          : sent() === 'GitHub Actions OIDC'
-            ? [{ instruction: 'Pass a token it accepts in BOARD_TOKEN' }]
-            : [{ instruction: 'Log in again', argv: ['vercel', 'login'] }],
+      REPLACE_TOKEN[sent() ?? ''] ?? [{ instruction: 'Log in again', argv: ['vercel', 'login'] }],
     )
   if (status === 403) return theirs('permission', 'permission_denied', `You can't ${doing()}.`, refusedRecoveries())
   if (status === 404) {

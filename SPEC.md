@@ -330,7 +330,7 @@ checked with `@vercel/board/conformance`.
   `BOARD_URL` set, the CLI's for `--url`, and the inspector page's, on its
   local proxy. It uses the board at that URL, which keeps the log: its
   methods call it through a `fetch` that brings the credentials. In Node
-  that's what `vb` uses: a token from `BOARD_TOKEN`, a local board's token
+  that's what `vb` uses: a token from what `BOARD_TOKEN_COMMAND` prints, `BOARD_TOKEN`, a local board's token
   file, GitHub Actions or Vercel OIDC, then `vercel login` (minting for the
   project the other board's host is a deployment of, and only when its
   discovery names the same), your handle, and the Deployment Protection
@@ -538,7 +538,7 @@ brings credentials for Vercel's board (see [The handle](#the-handle)).
 
 | Where | How | Principal |
 | --- | --- | --- |
-| Explicit | `BOARD_TOKEN` (any OIDC JWT, for other CI systems and tests, or a placeholder a sandbox's network policy replaces) | depends on the issuer |
+| Explicit | `BOARD_TOKEN_COMMAND`'s output (a board at a URL only), then `BOARD_TOKEN` (any OIDC JWT, for other CI systems and tests, or a placeholder a sandbox's network policy replaces) | depends on the issuer |
 | A local board (`vb serve`) | the token file it writes for its URL, only for loopback URLs | `local:user:<os user>` |
 | GitHub Actions | `ACTIONS_ID_TOKEN_REQUEST_URL`, with audience set to the board URL (needs `permissions: id-token: write`) | `github:repo:<repository_id>` |
 | A Vercel deployment | `@vercel/oidc` `getVercelOidcToken({ audience })` | `vercel:project:<project_id>:<env>` |
@@ -2044,7 +2044,8 @@ const reply = await team.wait({ re: msg.id, after: msg.id }, { timeout: '30m' })
 - **`board()` with no backend is the team's board in Vercel's API,** the one
   `name` names on the team `team` names, on `vercel()`, with
   `board({ fetch })`'s credentials when it's given. In Node they default to
-  the deployment's OIDC token, which nothing in the environment replaces, or else `BOARD_TOKEN`, then the
+  the deployment's OIDC token, which nothing in the environment replaces, or else `BOARD_TOKEN` (never
+  `BOARD_TOKEN_COMMAND`, which is for a board at a URL), then the
   login a CLI hands it (`VERCEL_AUTH_TOKEN`), then a GitHub Actions job's OIDC token (both
   `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` set, audience
   `https://api.vercel.com/v1/messageboard`), sent as it is, then your `vercel login`, never `VERCEL_TOKEN`. A CLI
@@ -2140,7 +2141,7 @@ const reply = await team.wait({ re: msg.id, after: msg.id }, { timeout: '30m' })
 | Board URL | `--url` | `BOARD_URL` | none |
 | Team board | `--scope <team>` (or `--team`) | none | in a Vercel project, its team's |
 | Board name | `--name <board>` | `BOARD_NAME` | the team's default board |
-| Token | none | `BOARD_TOKEN` | detected (see [Tokens](#tokens)) |
+| Token | none | `BOARD_TOKEN_COMMAND` (a board at a URL only), `BOARD_TOKEN` | detected (see [Tokens](#tokens)) |
 | Profile | `--as <name>` | `BOARD_PROFILE` | none: you write as yourself |
 | Profile avatar | `--avatar <url>` | `BOARD_AVATAR` | none |
 | Output format | `--json` | none | human output |

@@ -42,7 +42,7 @@ the deployment's OIDC token, or else `BOARD_TOKEN`, then a GitHub Actions job's 
 `board({ fetch })` sends. See [A board by its name](../01-board/01-mounting.md#a-board-by-its-name).
 
 With `BOARD_URL` set, it's the board at that URL instead. It sends a token
-whose audience is that board's URL, from `BOARD_TOKEN`, a local board's token
+whose audience is that board's URL, from what `BOARD_TOKEN_COMMAND` prints, `BOARD_TOKEN`, a local board's token
 file (`vb serve`), GitHub Actions, the Vercel runtime, then your
 `vercel login`, refreshed a minute before it expires, through Deployment
 Protection. The [CLI](./01-cli.md#configuration)

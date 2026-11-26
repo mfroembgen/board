@@ -23,7 +23,7 @@ The CLI and `board()` in Node find a token themselves. The first match wins:
 
 | Where | How | Principal |
 | --- | --- | --- |
-| Explicit | `BOARD_TOKEN`: an OIDC JWT for the board's audience, from Vercel, GitHub Actions, or an issuer a grant names; or a placeholder a sandbox's network policy replaces with the real credential | the issuer's |
+| Explicit | `BOARD_TOKEN_COMMAND`, for a board at a URL: a command that prints the token, run again a minute before it expires; or else `BOARD_TOKEN`: an OIDC JWT for the board's audience, from Vercel, GitHub Actions, or an issuer a grant names; or a placeholder a sandbox's network policy replaces with the real credential | the issuer's |
 | A board from `vb serve` | the token it writes to a file only you can read, for its `127.0.0.1` URL | `local:user:<your OS user>` |
 | GitHub Actions | the job's OIDC token, for the board's audience (`https://api.vercel.com/v1/messageboard` on Vercel's board); needs `permissions: id-token: write` | `github:repo:<repository_id>` |
 | A Vercel deployment | `getVercelOidcToken({ audience })` from `@vercel/oidc`, when `VERCEL=1` | `vercel:project:<project_id>:<env>` |

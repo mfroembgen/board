@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'
@@ -313,6 +313,94 @@ async function tokenFromVercelCli(project: { id: string; team: string | null }):
   }
 }
 
+const TOKEN_COMMAND = 'BOARD_TOKEN_COMMAND'
+
+const COMMAND_TIMEOUT = 6 * 60_000
+const COMMAND_GRACE = 2_000
+const COMMAND_OUTPUT_MAX = 64 * 1024
+const REFUSALS_KEPT = 32
+const REFUSED_AGAIN = Symbol('refused again')
+const BEARER = /^[A-Za-z0-9\-._~+/]+=*$/
+
+const commandFailed = (why: string) =>
+  new BoardError('no_token', `${TOKEN_COMMAND} ${why}, so there's no token to send.`, 401, {
+    hint: `Run it yourself to see why, or unset ${TOKEN_COMMAND}.`,
+  })
+
+type Run = { command: string; destination: string; refused: boolean }
+
+function printedToken(printed: Buffer[]): string {
+  const token = Buffer.concat(printed).toString('utf8').trim()
+  if (!token) throw commandFailed('printed nothing')
+  if (!BEARER.test(token)) throw commandFailed("printed something that isn't a bearer token")
+  return token
+}
+
+function runCommand({ command, destination, refused }: Run): Promise<string> {
+  const env: NodeJS.ProcessEnv = { ...process.env, BOARD_URL: destination }
+  delete env.BOARD_TOKEN_REFRESH
+  if (refused) env.BOARD_TOKEN_REFRESH = '1'
+  const child = spawn('/bin/sh', ['-c', command], { stdio: ['ignore', 'pipe', 'inherit'], env })
+  return new Promise((resolve, reject) => {
+    const printed: Buffer[] = []
+    let bytes = 0
+    let exited = false
+    let drained = false
+    let settled = false
+    let stopping: BoardError | null = null
+    let kill: NodeJS.Timeout | undefined
+    const done = (outcome: () => string) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      clearTimeout(kill)
+      child.stdout.destroy()
+      try {
+        resolve(outcome())
+      } catch (error) {
+        reject(error)
+      }
+    }
+    const fail = (error: BoardError) => () => {
+      throw error
+    }
+    const stop = (why: string) => {
+      if (settled || stopping) return
+      const failure = commandFailed(why)
+      stopping = failure
+      clearTimeout(timer)
+      child.stdout.destroy()
+      if (exited) return done(fail(failure))
+      child.kill('SIGTERM')
+      kill = setTimeout(() => child.kill('SIGKILL'), COMMAND_GRACE)
+    }
+    const timer = setTimeout(() => stop('took longer than 6 minutes'), COMMAND_TIMEOUT)
+    child.stdout.on('data', (chunk: Buffer) => {
+      bytes += chunk.length
+      if (bytes <= COMMAND_OUTPUT_MAX) return void printed.push(chunk)
+      stop('printed more than 64 KiB')
+    })
+    const finished = () => exited && drained && done(() => printedToken(printed))
+    child.stdout.on('end', () => {
+      drained = true
+      finished()
+    })
+    child.on('error', () => done(fail(commandFailed("couldn't start"))))
+    child.on('exit', (code, signal) => {
+      exited = true
+      if (stopping) return done(fail(stopping))
+      if (code !== 0) return done(fail(commandFailed(code === null ? `was stopped by ${signal}` : `exited with ${code}`)))
+      finished()
+      setTimeout(() => done(() => printedToken(printed)), COMMAND_GRACE).unref()
+    })
+  })
+}
+
+const onVercelApi = (url: string) => {
+  const hostname = new URL(url).hostname.toLowerCase().replace(/\.$/, '')
+  return hostname === 'vercel.com' || hostname.endsWith('.vercel.com')
+}
+
 /** Whether this is a GitHub Actions job that may ask GitHub for an OIDC token (`permissions: id-token: write`). */
 export const inGithubActions = () => !!process.env.ACTIONS_ID_TOKEN_REQUEST_URL && !!process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN
 
@@ -344,13 +432,14 @@ export function boardUrl(): string {
 export type NodeTransport = {
   /** Every request to the board, through Deployment Protection, with a token for it (all but discovery). */
   fetch: typeof fetch
-  /** Where the token came from, in words, once one was minted: `vercel login`, `BOARD_TOKEN`, … */
+  /** Where the token came from, in words, once one was minted: `vercel login`, `BOARD_TOKEN_COMMAND`, `BOARD_TOKEN`, … */
   source(): string | null
 }
 
 /**
  * How a client reaches the board at `url` from Node: through Deployment Protection, with a token
- * from `token`, the login of an app that runs board's CLI (`appLogin`), `BOARD_TOKEN`, a local
+ * from `token`, the login of an app that runs board's CLI (`appLogin`), what `BOARD_TOKEN_COMMAND`
+ * prints for `url` (run again a minute before its token expires, and once more on a 401 with `BOARD_TOKEN_REFRESH=1`), `BOARD_TOKEN`, a local
  * board's token file (`vb serve`), GitHub Actions, the Vercel runtime, or your Vercel CLI login,
  * in that order. Who you are is the token's to say: the board
  * names you from what it verifies. A board with no Vercel project has no token for your login to
@@ -408,6 +497,12 @@ export function connect(
       const discovered = await discover()
       if (discovered.project_id) return asPerson(discovered, passed !== null ? PASSED : 'vercel login')
     }
+    const command = process.env[TOKEN_COMMAND]
+    if (command && !onVercelApi(url)) {
+      const minted = await fromCommand(command)
+      source = TOKEN_COMMAND
+      return minted
+    }
     if (process.env.BOARD_TOKEN) {
       const token = process.env.BOARD_TOKEN
       source = 'BOARD_TOKEN'
@@ -433,10 +528,80 @@ export function connect(
     if (!discovered.project_id) return { token: null, expiresAt: Date.now() + 5 * 60_000 }
     return asPerson(discovered, 'vercel login')
   }
-  const token = async () => {
+  let generation = 0
+  let refreshFor: string | null = null
+  const refusals = new Set<string>()
+  let running: { key: string | number; run: Promise<Minted> } | null = null
+  const fromCommand = (command: string): Promise<Minted> => {
+    const refused = refreshFor
+    const key = refused ?? generation
+    if (running?.key === key) return running.run
+    const started = generation
+    const run = runCommand({ command, destination: url, refused: refused !== null }).then((token) => {
+      const minted = { token, expiresAt: expiry(token) }
+      if (refused !== null && !refusals.has(token) && started === generation) {
+        cached = minted
+        refreshFor = null
+      }
+      return minted
+    })
+    const slot = { key, run }
+    running = slot
+    const settled = () => {
+      if (running === slot) running = null
+    }
+    run.then(settled, settled)
+    return run
+  }
+  const pendRefresh = (refused: string) => {
+    cached = null
+    refreshFor = refused
+    generation += 1
+  }
+  const refuse = (sent: string) => {
+    refusals.delete(sent)
+    refusals.add(sent)
+    if (refusals.size > REFUSALS_KEPT) refusals.delete(refusals.values().next().value!)
+    if (cached ? cached.token !== sent : refreshFor !== null) return
+    pendRefresh(sent)
+  }
+  const fresh = (minted: Minted | null): minted is Minted => minted !== null && minted.expiresAt - 60_000 >= Date.now()
+  const usable = async (): Promise<string | null | typeof REFUSED_AGAIN> => {
     // One handed over is asked again each time: a function returns a fresh one.
-    if (options.token !== undefined || !cached || cached.expiresAt - 60_000 < Date.now()) cached = await mint()
-    return cached.token
+    if (options.token === undefined && fresh(cached)) return cached.token
+    const started = generation
+    const minted = await mint()
+    if (started !== generation) return usable()
+    if (minted.token === null || !refusals.has(minted.token)) {
+      if (refreshFor === null) cached = minted
+      return minted.token
+    }
+    if (refreshFor !== null) return REFUSED_AGAIN
+    pendRefresh(minted.token)
+    return usable()
+  }
+  const token = async (): Promise<string | null> => {
+    const picked = await usable()
+    if (picked === REFUSED_AGAIN) throw commandFailed('printed a token the board refused')
+    return picked
+  }
+  const retried = async (input: RequestInfo | URL, init: RequestInit, headers: Headers, sent: string, refusal: Response) => {
+    const discard = () => void refusal.body?.cancel().catch(() => {})
+    const refreshed = await usable().catch((error: unknown) => {
+      discard()
+      throw error
+    })
+    const again = fresh(cached) && cached.token !== null && !refusals.has(cached.token) ? cached.token : refreshed
+    if (again === REFUSED_AGAIN) {
+      discard()
+      throw commandFailed('printed a token the board refused')
+    }
+    if (again === null || again === sent || refusals.has(again)) return refusal
+    discard()
+    headers.set('authorization', `Bearer ${again}`)
+    const response = await doFetch(input, { ...init, headers })
+    if (response.status === 401 && fromBoard(response)) refuse(again)
+    return response
   }
 
   const send = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
@@ -446,12 +611,18 @@ export function connect(
     const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
     // Discovery is public: it's what a token is minted from.
     let bare = false
+    let sent: string | null = null
     if (!(method === 'GET' && path === '/') && !headers.has('authorization')) {
-      const credential = await token()
-      if (credential !== null) headers.set('authorization', `Bearer ${credential}`)
+      sent = await token()
+      if (sent !== null) headers.set('authorization', `Bearer ${sent}`)
       else bare = true
     }
     const response = await doFetch(input, { ...init, headers })
+    if (response.status === 401 && sent !== null && source === TOKEN_COMMAND && fromBoard(response)) {
+      refuse(sent)
+      if (!replayable(input, init)) return response
+      return retried(input, init, headers, sent, response)
+    }
     // It went with no token, and the board took it for no one's.
     if (bare && response.status === 401) {
       await response.body?.cancel().catch(() => {})
@@ -462,7 +633,16 @@ export function connect(
     return response
   }) as typeof fetch
 
+  const fromBoard = (response: Response) => !response.url || new URL(response.url).origin === new URL(url).origin
+
   return { fetch: send, source: () => source }
+}
+
+function replayable(input: RequestInfo | URL, { body }: RequestInit): boolean {
+  if (input instanceof Request) return false
+  if (body === undefined || body === null || typeof body === 'string') return true
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return true
+  return body instanceof Blob || body instanceof URLSearchParams || body instanceof FormData
 }
 
 /**

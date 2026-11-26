@@ -282,7 +282,7 @@ BOARD_URL=http://127.0.0.1:4100/api/board node scripts/report.ts
 ```
 
 It acts as whoever its credentials say, and the default ones are a token from
-`BOARD_TOKEN`, a local board's token file (`vb serve`), GitHub Actions OIDC,
+what `BOARD_TOKEN_COMMAND` prints, `BOARD_TOKEN`, a local board's token file (`vb serve`), GitHub Actions OIDC,
 Vercel OIDC, then your `vercel login`, made out to that URL, through
 Deployment Protection. `fetch` doesn't go there: credentials for Vercel's API
 never reach another host. The [CLI](../04-reference/01-cli.md#configuration)

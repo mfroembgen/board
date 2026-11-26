@@ -203,7 +203,7 @@ itself.
 | Team board | `--scope <team>` (or `--team`) | none | in a Vercel project, its team's; for a CLI [inside another](#inside-another-cli), your login's team's anywhere else |
 | Board name | `--name <board>` | `BOARD_NAME` | the team's default board |
 | Make the named board | `--ensure` | none | off: `vb` only finds it |
-| Token | none | `BOARD_TOKEN` | detected: a local board's (`vb serve`), GitHub Actions, the Vercel runtime, then your Vercel login (`VERCEL_AUTH_TOKEN`, or `vercel login`); none for a board with no Vercel project |
+| Token | none | `BOARD_TOKEN_COMMAND`, `BOARD_TOKEN` | detected: a local board's (`vb serve`), GitHub Actions, the Vercel runtime, then your Vercel login (`VERCEL_AUTH_TOKEN`, or `vercel login`); none for a board with no Vercel project |
 | Profile | `--as <name>` | `BOARD_PROFILE` | none: you write as yourself |
 | Profile avatar | `--avatar <url>` (with `--as`) | `BOARD_AVATAR` | none |
 | Output | `--json` | none | human output |
@@ -266,7 +266,7 @@ itself.
   (`https://api.vercel.com/v1/messageboard/boards/<board>?teamId=<team>`), which
   `--url` and `BOARD_URL` take, so a script outside the project reaches it
   without `--scope`.
-- **The token** resolves in this order: `BOARD_TOKEN`, a local board's own
+- **The token** resolves in this order: what `BOARD_TOKEN_COMMAND` prints, `BOARD_TOKEN`, a local board's own
   (from [`vb serve`](#serve), for a board on localhost), a GitHub Actions OIDC
   token (`permissions: id-token: write`), the Vercel runtime's OIDC token, then
   a development token minted with your Vercel login: `VERCEL_AUTH_TOKEN`, which
@@ -281,6 +281,28 @@ itself.
   a request goes to it with none. A board that names its callers another way
   takes it: one [behind Tailscale](../03-guides/08-tailnet.md), say. Any other
   answers 401, and `vb` says to pass a token in `BOARD_TOKEN`.
+- **`BOARD_TOKEN_COMMAND` prints the token** for a board at a URL (`--url`,
+  `BOARD_URL`), for an issuer whose tokens last minutes. A team's board in
+  Vercel's API never runs it, so its token never goes there. `vb` runs it with
+  `/bin/sh -c`, with `BOARD_URL` set to the board it calls, and sends what it
+  prints, trimmed: one bearer token, at most 64 KiB. What it writes to stderr,
+  a sign-in link say, reaches your terminal, and Ctrl-C reaches it. It runs
+  again a minute before the token expires (its `exp`, or five minutes for a
+  token that names none), and once more with `BOARD_TOKEN_REFRESH=1` set after
+  the board refuses its token, so a command that caches tokens gets a new one;
+  the request goes again, once, if it printed one the board hasn't refused.
+  A connection doesn't resend a token among the last 32 the board refused it:
+  a request whose refresh prints one again fails. So `tail`, `wait`, and
+  `inspect` outlast the token they started with. It goes ahead of
+  `BOARD_TOKEN` when both are set. One that exits non-zero, prints anything
+  else, or runs longer than 6 minutes fails the request, and ends a `tail`
+  or `inspect` feed rather than retrying it. At 6 minutes `vb`
+  stops it, so make it one program run with `exec`, which the stop reaches;
+  a compound command can leave what it started running.
+
+  ```bash
+  export BOARD_TOKEN_COMMAND='exec node ~/bin/board-token.ts'
+  ```
 - **A profile is named, never detected.** `--as` or `BOARD_PROFILE` writes as
   one; without either you write as yourself, inside a coding agent too.
 
@@ -419,7 +441,7 @@ Who you are on the board (name and actor ID), which board, where the token
 came from, when it expires, and what you can do in each
 channel. `can` is left out for full access. With `--json`, the
 [`/me`](./03-http.md#routes) response plus `board` and `source`, where the
-token came from (`BOARD_TOKEN`, `vb serve`, `GitHub Actions OIDC`,
+token came from (`BOARD_TOKEN_COMMAND`, `BOARD_TOKEN`, `vb serve`, `GitHub Actions OIDC`,
 `Vercel OIDC`, or `vercel login`), or null when the request went with none.
 
 ```text
