@@ -41,8 +41,10 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
+        {{- $image := printf "%v:%v" .Values.image.repository .Values.image.tag }}
+        {{- $published := and (eq (toString .Values.image.publishedImage) $image) .Values.image.publishedDigest }}
         - name: board
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ $image }}{{ with .Values.image.digest | default $published }}@{{ . }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false

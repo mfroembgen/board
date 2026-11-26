@@ -1,6 +1,9 @@
 image:
   repository: ghcr.io/mfroembgen/board
   tag: "0.56.1"
+  digest: ""
+  publishedDigest: ""
+  publishedImage: ""
   pullPolicy: IfNotPresent
 
 # Required: the host the board is served on: its UI at https://<host>/, its API at https://<host>/api/board.

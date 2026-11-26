@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Prints an AuthKit access token for the board, for vb's BOARD_TOKEN. Signs in through the browser
-// (S256 PKCE on a loopback port) the first time or with --login, then refreshes. Keeps the client,
+// Prints an AuthKit access token for the board, for vb's BOARD_TOKEN_COMMAND. Signs in through the browser
+// (S256 PKCE on a loopback port) the first time or with --login, then refreshes: when the token has two
+// minutes or less left, or with --refresh or BOARD_TOKEN_REFRESH=1 (vb sets it after the board refuses a token). Keeps the client,
 // refresh token and current access token in ~/.config/board-token/, one file per issuer and board, readable
 // only by you. Parallel runs share one refresh: the first takes a lock, the others wait and reuse its token.
 import { createHash, randomBytes } from 'node:crypto'
@@ -115,7 +116,7 @@ async function locked<T>(work: () => Promise<T>): Promise<T> {
 }
 
 const fresh = (saved: Saved | null): saved is Saved & { accessToken: string } =>
-  !!saved?.accessToken && (saved.expiresAt ?? 0) > Date.now() + 60_000
+  !!saved?.accessToken && (saved.expiresAt ?? 0) > Date.now() + 120_000
 
 async function token(body: Record<string, string>): Promise<Tokens> {
   const response = await fetch(`${ISSUER}/oauth2/token`, { method: 'POST', body: new URLSearchParams({ ...body, resource: BOARD }) })
@@ -203,11 +204,14 @@ const kept = (tokens: Tokens, refreshToken?: string) => ({
 })
 
 const forced = process.argv.includes('--login')
+const refreshing = process.argv.includes('--refresh') || process.env.BOARD_TOKEN_REFRESH === '1'
 let saved = await load()
-if (forced || !fresh(saved)) {
+const seen = saved?.accessToken
+if (forced || refreshing || !fresh(saved)) {
   saved = await locked(async () => {
     const current = await load()
-    if (!forced && fresh(current)) return current
+    const renewed = current?.accessToken !== seen
+    if (!forced && fresh(current) && (!refreshing || renewed)) return current
     let next: Saved
     if (forced || !current?.refreshToken) next = await login(current)
     else {

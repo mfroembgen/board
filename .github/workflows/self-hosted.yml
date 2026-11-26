@@ -4,16 +4,20 @@ on:
   pull_request:
     paths:
       - templates/self-hosted/**
+      - packages/board/**
+      - pnpm-lock.yaml
       - .github/workflows/self-hosted.yml
   push:
     branches: [main]
     paths:
       - templates/self-hosted/**
+      - packages/board/**
+      - pnpm-lock.yaml
       - .github/workflows/self-hosted.yml
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the image and chart after all checks pass
+        description: Publish the image, chart and CLI after all checks pass, replacing those from another commit
         type: boolean
         default: false
 
@@ -31,6 +35,8 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.22.3
@@ -41,14 +47,21 @@ jobs:
           node --input-type=module >> "$GITHUB_OUTPUT" <<'EOF'
             import { readFileSync } from "node:fs"
             const pkg = JSON.parse(readFileSync("package.json", "utf8"))
+            const cli = JSON.parse(readFileSync("../../packages/board/package.json", "utf8"))
             const field = (file, key) => readFileSync(file, "utf8").match(new RegExp(`^${key}: "?([^"\\n]+)"?$`, "m"))?.[1]
             const tag = readFileSync("chart/values.yaml", "utf8").match(/^  tag: "([^"]+)"$/m)?.[1]
             const released = readFileSync("pnpm-workspace.yaml", "utf8").match(/'@vercel\/board@([^']+)'/)?.[1]
-            const versions = [pkg.version, pkg.dependencies["@vercel/board"], released, field("chart/Chart.yaml", "version"), field("chart/Chart.yaml", "appVersion"), tag]
+            const versions = [pkg.version, pkg.dependencies["@vercel/board"], released, field("chart/Chart.yaml", "version"), field("chart/Chart.yaml", "appVersion"), tag, cli.version]
             if (!/^\d+\.\d+\.\d+$/.test(pkg.version) || new Set(versions).size !== 1)
-              throw new Error(`template, @vercel/board, its release-age exclusion, chart and image versions must match: ${versions.join(", ")}`)
+              throw new Error(`template, @vercel/board, its release-age exclusion, chart, image and CLI versions must match: ${versions.join(", ")}`)
             console.log(`version=${pkg.version}`)
           EOF
+      - name: Check the README's CLI URL
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          expected="https://github.com/mfroembgen/board/releases/download/%40vercel/board%40$VERSION/vercel-board-$VERSION.tgz"
+          test "$(grep -o 'https://github.com/[^ ]*/vercel-board-[^ ]*\.tgz' README.md)" = "$expected"
       - run: corepack enable && pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
@@ -57,6 +70,21 @@ jobs:
           set -- --set host=board.example.com,authkitIssuer=https://tenant.authkit.app,teamDomain=example.com
           helm lint --strict chart "$@"
           helm template board chart "$@" > /tmp/board.yaml
+          image="ghcr.io/mfroembgen/board:$VERSION"
+          digest=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          published=sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+          grep -F "image: \"$image\"" /tmp/board.yaml
+          helm template board chart "$@" --set "image.digest=$digest" | grep -F "image: \"$image@$digest\""
+          set -- "$@" --set "image.publishedDigest=$published,image.publishedImage=$image"
+          helm template board chart "$@" | grep -F "image: \"$image@$published\""
+          helm template board chart "$@" --set "image.digest=$digest" | grep -F "image: \"$image@$digest\""
+          helm template board chart "$@" --set image.repository=mirror.example.com/board,image.digest=$digest \
+            | grep -F "image: \"mirror.example.com/board:$VERSION@$digest\""
+          helm template board chart "$@" --set image.repository=mirror.example.com/board | grep -F "image: \"mirror.example.com/board:$VERSION\""
+          helm template board chart "$@" --set image.tag=mine | grep -F 'image: "ghcr.io/mfroembgen/board:mine"'
+          helm template board chart "$@" --set image.tag=12345 | grep -F 'image: "ghcr.io/mfroembgen/board:12345"'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
       - name: Smoke-test the image on a read-only root
         run: |
           docker build --tag board:check .
@@ -68,6 +96,25 @@ jobs:
           curl -fs http://127.0.0.1:8080/api/board | grep -F '"audience":"http://127.0.0.1:8080/api/board"'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/board/channels)" = 401
           curl -fs http://127.0.0.1:8080/ | grep -F 'href="/sign-in'
+      - name: Pack the CLI
+        working-directory: .
+        run: |
+          pnpm install --frozen-lockfile --filter @vercel/board...
+          pnpm --dir packages/board pack --pack-destination "$RUNNER_TEMP/cli"
+          test -f "$RUNNER_TEMP/cli/vercel-board-$VERSION.tgz"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+      - name: Smoke-test the CLI as people run it
+        working-directory: ${{ runner.temp }}
+        run: npx -y "file:$RUNNER_TEMP/cli/vercel-board-$VERSION.tgz" --help | grep -F BOARD_TOKEN_COMMAND
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli
+          path: ${{ runner.temp }}/cli/vercel-board-${{ steps.version.outputs.version }}.tgz
+          if-no-files-found: error
+          retention-days: 7
 
   release:
     if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main' && github.repository == 'mfroembgen/board'
@@ -76,12 +123,13 @@ jobs:
     concurrency:
       group: board-release-${{ needs.verify.outputs.version }}
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: write
       packages: write
     env:
       VERSION: ${{ needs.verify.outputs.version }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: "@vercel/board@${{ needs.verify.outputs.version }}"
     steps:
       # The `if` above compares case-insensitively, so `refs/heads/Main` would pass it; this doesn't.
       - name: Publish only from main
@@ -90,21 +138,35 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
+      - name: Publish only main's newest commit
+        run: |
+          git fetch --no-tags "https://github.com/$GITHUB_REPOSITORY.git" refs/heads/main
+          head="$(git rev-parse FETCH_HEAD)"
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "main is at $head now, so $GITHUB_SHA is superseded; only a dispatch from main's newest commit publishes" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli
+          path: ${{ runner.temp }}/cli
+      - name: Check the CLI before publishing anything
+        run: |
+          mkdir "$RUNNER_TEMP/cli-check"
+          tar -xzf "$RUNNER_TEMP/cli/vercel-board-$VERSION.tgz" -C "$RUNNER_TEMP/cli-check"
+          test "$(jq -r .version "$RUNNER_TEMP/cli-check/package/package.json")" = "$VERSION"
+          grep -rqF BOARD_TOKEN_COMMAND "$RUNNER_TEMP/cli-check/package/dist"
       - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
-      - name: Verify upstream tag and release source
+      - name: Verify upstream tag
         id: source
         run: |
-          tag="@vercel/board@$VERSION"
-          git fetch --no-tags https://github.com/vercel/board.git "refs/tags/$tag"
+          git fetch --no-tags https://github.com/vercel/board.git "refs/tags/$TAG"
           upstream_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
-          test "$(git rev-parse "$tag^{commit}")" = "$upstream_sha"
+          test "$(git rev-parse "$TAG^{commit}")" = "$upstream_sha"
           git merge-base --is-ancestor "$upstream_sha" "$GITHUB_SHA"
           test "$upstream_sha" != "$GITHUB_SHA"
           echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
-          if gh release view "$tag" > /dev/null 2>&1; then
-            echo "Release $tag already exists; inspect its provenance before retrying" >&2
-            exit 1
-          fi
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -112,20 +174,58 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Require unused image and chart versions
+      - name: Compare the published image and chart with this commit
+        id: published
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
         run: |
-          for ref in "ghcr.io/mfroembgen/board:$VERSION" "ghcr.io/mfroembgen/charts/board:$VERSION"; do
-            if docker buildx imagetools inspect --raw "$ref" > /tmp/manifest.json 2> /tmp/manifest-error; then
-              echo "$ref already exists; inspect its provenance before retrying" >&2
-              exit 1
-            fi
+          printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io --username "$GHCR_USER" --password-stdin
+          found() {
+            if docker buildx imagetools inspect "${@:2}" "$1" > /tmp/found.json 2> /tmp/found-error; then return 0; fi
             # A version, or a whole package, that isn't there yet. Anything else, a denial included, stops here.
-            if ! grep -Eq "$ref: not found|manifest unknown|name unknown" /tmp/manifest-error; then
-              cat /tmp/manifest-error >&2
-              exit 1
+            grep -Eq "$1: not found|manifest unknown|name unknown" /tmp/found-error && return 1
+            cat /tmp/found-error >&2
+            exit 1
+          }
+          decide() {
+            if [ "$2" = "$GITHUB_SHA" ]; then
+              echo "$1 is already built from $GITHUB_SHA; keeping it"
+              decided=keep
+            else
+              echo "::notice::Replacing $1, built from ${2:-an unrecorded commit}, with $GITHUB_SHA"
+              decided=push
             fi
-          done
+          }
+          image="ghcr.io/mfroembgen/board:$VERSION"
+          image_action=push
+          if found "$image" --format '{{json .Image}}'; then
+            decide "$image" "$(jq -r 'if has("config") then . else .["linux/amd64"] end | .config.Labels["org.opencontainers.image.revision"] // empty' /tmp/found.json)"
+            image_action="$decided"
+          fi
+          chart="ghcr.io/mfroembgen/charts/board:$VERSION"
+          chart_action=push
+          if found "$chart" --raw; then
+            decide "$chart" "$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' /tmp/found.json)"
+            chart_action="$decided"
+          fi
+          if [ "$image_action" = push ] && [ "$chart_action" = keep ]; then
+            echo "::notice::Pushing $chart again, for the new image's digest"
+            chart_action=push
+          fi
+          if [ "$chart_action" = keep ]; then
+            current="$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' | jq -r .digest)"
+            pinned="$(helm template board oci://ghcr.io/mfroembgen/charts/board --version "$VERSION" \
+              --set host=board.example.com,authkitIssuer=https://tenant.authkit.app,teamDomain=example.com \
+              | yq 'select(.kind == "Deployment") | .spec.template.spec.containers[] | select(.name == "board") | .image')"
+            if [ "$pinned" != "$image@$current" ]; then
+              echo "::notice::Pushing $chart again: it pins '$pinned', and $image is $current"
+              chart_action=push
+            fi
+          fi
+          printf 'image=%s\nchart=%s\n' "$image_action" "$chart_action" >> "$GITHUB_OUTPUT"
       - name: Publish image
+        if: steps.published.outputs.image == 'push'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: templates/self-hosted
@@ -138,27 +238,73 @@ jobs:
           provenance: true
           sbom: true
       - name: Publish Helm chart
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHCR_USER: ${{ github.actor }}
+        if: steps.published.outputs.chart == 'push'
         run: |
-          printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io --username "$GHCR_USER" --password-stdin
+          DIGEST="$(docker buildx imagetools inspect "ghcr.io/mfroembgen/board:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          export DIGEST
+          yq -i '.image.publishedDigest = strenv(DIGEST) | .image.publishedImage = .image.repository + ":" + .image.tag' chart/values.yaml
+          yq -i '.annotations["org.opencontainers.image.revision"] = strenv(GITHUB_SHA)' chart/Chart.yaml
           helm package chart --destination /tmp/charts
           helm push "/tmp/charts/board-$VERSION.tgz" oci://ghcr.io/mfroembgen/charts
-      - name: Draft the release
+      - name: Attach the CLI, then write the notes and publish the release
         env:
           UPSTREAM_SHA: ${{ steps.source.outputs.upstream_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           printf '%s\n' \
-            "A self-hosted @vercel/board: image and Helm chart from templates/self-hosted." \
+            "A self-hosted @vercel/board: image, Helm chart and CLI from the fork." \
             "" \
-            "Upstream tag: @vercel/board@$VERSION" \
+            "Upstream tag: $TAG" \
             "Upstream commit: $UPSTREAM_SHA" \
             "Patched source commit: $GITHUB_SHA" \
             "Image: ghcr.io/mfroembgen/board:$VERSION" \
             "Helm chart: oci://ghcr.io/mfroembgen/charts/board, version $VERSION" \
+            "CLI: vercel-board-$VERSION.tgz, its commit in vercel-board-$VERSION.tgz.commit" \
             "" \
             "The Git tag points to the original upstream commit. The artifacts use the patched source commit recorded above." \
             > /tmp/release-notes.md
-          gh release create "@vercel/board@$VERSION" --verify-tag --draft \
-            --title "Self-hosted board $VERSION" --notes-file /tmp/release-notes.md
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --draft --title "Self-hosted board $VERSION" --notes-file /tmp/release-notes.md
+          fi
+          asset="vercel-board-$VERSION.tgz"
+          dir="$RUNNER_TEMP/cli"
+          printf '%s\n' "$GITHUB_SHA" > "$dir/$asset.commit"
+          names="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          recorded=""
+          if grep -qxF "$asset.commit" <<< "$names"; then
+            recorded="$(gh release download "$TAG" --pattern "$asset.commit" --output -)"
+          fi
+          if [ "$recorded" = "$GITHUB_SHA" ] && grep -qxF "$asset" <<< "$names"; then
+            echo "$asset is already built from $GITHUB_SHA; keeping it"
+          else
+            if grep -qxF "$asset" <<< "$names"; then
+              echo "::notice::Replacing $asset, built from ${recorded:-an unrecorded commit}, with $GITHUB_SHA"
+            fi
+            gh release upload "$TAG" "$dir/$asset" --clobber
+            uploaded="$(gh release download "$TAG" --pattern "$asset" --output - | sha256sum | cut -d' ' -f1)"
+            test "$uploaded" = "$(sha256sum "$dir/$asset" | cut -d' ' -f1)"
+            gh release upload "$TAG" "$dir/$asset.commit" --clobber
+          fi
+          gh release edit "$TAG" --notes-file /tmp/release-notes.md
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
+            gh release edit "$TAG" --draft=false
+          fi
+
+  check-cli:
+    needs: [verify, release]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.3
+      - name: Run the README's CLI with no credentials
+        run: |
+          url="https://github.com/mfroembgen/board/releases/download/%40vercel/board%40$VERSION/vercel-board-$VERSION.tgz"
+          npx -y "$url" --help | grep -F BOARD_TOKEN_COMMAND

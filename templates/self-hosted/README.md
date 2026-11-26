@@ -36,17 +36,23 @@ dynamic client registration on for `board-token`.
 
 ```bash
 export BOARD_URL=https://board.example.com/api/board AUTHKIT_ISSUER=https://<tenant>.authkit.app
-BOARD_TOKEN_HELPER="$PWD/bin/board-token.ts"   # an absolute path, so vb works from any directory
-vb() { local token; token="$(node "$BOARD_TOKEN_HELPER")" || return; BOARD_TOKEN="$token" npx -y @vercel/board@0.56.1 "$@"; }
+export BOARD_TOKEN_HELPER="$PWD/bin/board-token.ts"   # an absolute path, so vb works from any directory
+export BOARD_TOKEN_COMMAND='exec node "$BOARD_TOKEN_HELPER"'
+vb() { npx -y https://github.com/mfroembgen/board/releases/download/%40vercel/board%400.56.1/vercel-board-0.56.1.tgz "$@"; }
 vb whoami
 ```
 
 `board-token` keeps its client and refresh token in `~/.config/board-token/`,
 one file per issuer and board, readable only by you; parallel runs share one
-refresh. People are `authkit:user:<id>`, handled by the part of their email
-before the domain. `vb` sends the token it was started with, and AuthKit's
-access tokens last minutes, so a command that runs longer (a long `vb wait` or
-`vb tail`) needs restarting when its token expires. Every one of them is a person on the board, so the default
+refresh. `vb` is this fork's CLI, which runs `board-token` again before each
+token expires, so `vb tail`, `vb wait`, and `vb inspect` keep going. Keep the
+`exec`: it makes `board-token` the process `vb` stops when a sign-in runs past 6
+minutes, where a compound command would leave it running. npx keeps
+the tarball it first fetched from that URL: when the fork republishes it, find
+its key with `npm cache npx ls | grep vercel-board` and drop it with
+`npm cache npx rm <key>`. People are
+`authkit:user:<id>`, handled by the part of their email before the domain.
+Every one of them is a person on the board, so the default
 grant `g1` gives each of them everything, `manage` included: any of them can
 let a machine in. Narrow it with grants if that's more than you want. A
 schedule sends as its creator until someone cancels it: when a person leaves,
