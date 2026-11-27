@@ -247,20 +247,34 @@ test('exclusions match namespaces whatever their case', async () => {
   assert.equal((await inbox(app, 'gitlab')).length, 1)
 })
 
-test('a board thread synced to an excluded merge request never posts there', async () => {
+test('a board thread attached to a GitLab merge request by hand gets nothing, and one imported from GitLab still does', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
+  const imported = await mergeRequestRoot(app)
+  const own = ((await (await asAda(app, 'POST', '/messages', { channel: 'general', text: 'a plan' })).json()) as { message: { id: string } }).message
+  assert.equal((await asAda(app, 'POST', `/messages/${own.id}/sync`, { target: 'gitlab:42:mr:8' })).status, 200)
+  assert.equal((await asAda(app, 'POST', `/messages/${imported.id}/sync`, { target: 'gitlab:42:mr:9' })).status, 200)
+
+  await asAda(app, 'POST', '/messages', { re: own.id, text: 'posted by the bot?' })
+  await asAda(app, 'POST', '/messages', { re: imported.id, text: 'thanks' })
+  await eventually(async () => (posted.some((path) => path.startsWith('/projects/42/merge_requests/7/')) ? true : undefined))
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  assert.deepEqual(posted.filter((path) => /\/merge_requests\/(8|9)\//.test(path)), [])
+  assert.ok(logged.some((line) => line === '[board] gitlab dropped: unimported target'))
+  assert.match(await (await app(new Request('https://board.test/metrics'))).text(), /^board_sync_dropped_total\{entry="gitlab",reason="unimported_target"\} [1-9]/m)
+})
+
+test('a project moved into an excluded group gets no more posts from the board', async () => {
   const app = board({ gitlab: gitlabSync(['acme/hiring']) })
   await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
-  const synced = await mergeRequestRoot(app)
-  const own = ((await (await asAda(app, 'POST', '/messages', { channel: 'general', text: 'candidate review' })).json()) as { message: { id: string } }).message
-  assert.equal((await asAda(app, 'POST', `/messages/${own.id}/sync`, { target: 'gitlab:50:mr:2' })).status, 200)
+  const root = await mergeRequestRoot(app)
+  await asAda(app, 'POST', '/messages', { re: root.id, text: 'first' })
+  await eventually(async () => (bodies.some((body) => body.includes('first')) ? true : undefined))
 
-  await asAda(app, 'POST', '/messages', { re: own.id, text: 'notes on the candidate' })
-  await asAda(app, 'POST', '/messages', { re: synced.id, text: 'thanks' })
-  await eventually(async () => (posted.some((path) => path.startsWith('/projects/42/')) ? true : undefined))
-  await new Promise((resolve) => setTimeout(resolve, 200))
-  assert.deepEqual(posted.filter((path) => path.startsWith('/projects/50/')), [])
-  assert.ok(logged.some((line) => line === '[board] gitlab dropped: excluded target acme/hiring'))
-  assert.match(await (await app(new Request('https://board.test/metrics'))).text(), /^board_sync_dropped_total\{entry="gitlab",reason="excluded_target"\} [1-9]/m)
+  api['/projects/42'] = { ...(api['/projects/42'] as object), path_with_namespace: 'acme/hiring/web' }
+  await asAda(app, 'POST', '/messages', { re: root.id, text: 'second' })
+  await eventually(async () => (logged.includes('[board] gitlab dropped: excluded target acme/hiring') ? true : undefined))
+  assert.ok(!bodies.some((body) => body.includes('second')))
 })
 
 test('a reply sent to GitLab runs no quick action, whichever line it puts one on', async () => {

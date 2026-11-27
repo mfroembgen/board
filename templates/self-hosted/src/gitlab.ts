@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { createGitLabAdapter, type GitLabAdapter } from '@chat-adapter/gitlab'
+import type { MessageView } from '@vercel/board'
 import type { ExternalAuthor, Receive, ReceivedEvent, SyncFn, SyncOverrides, SyncProvider, SyncRoot } from '@vercel/board/sync'
 import { chatSdk, type ChatSdkEvent } from '@vercel/board/sync-chat-sdk'
 import { segment } from './channels.ts'
@@ -68,6 +69,7 @@ type Noteable = {
 }
 
 const PIPELINE_FAILED = ['failed', 'canceled']
+const PATH_TTL_MS = 10 * 60 * 1000
 const GITLAB_CI: ExternalAuthor = { id: 'gitlab:user:gitlab-ci', handle: 'gitlab-ci', name: 'GitLab CI', avatar: null, isBot: true }
 
 export function gitlabChannel(path: string): string {
@@ -234,7 +236,7 @@ const withoutQuickActions = (markdown: string) => markdown.replace(/^(\s*)\//gm,
 
 const keptOnly = (emit: Receive): Receive => (received) => emit({ ...received, raw: received.event.kind === 'lifecycle' ? received.raw : null })
 
-export function gitlab(options: GitLabSync, drops: Drops): SyncProvider {
+export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: string) => Promise<MessageView>): SyncProvider {
   const adapter: GitLabAdapter = createGitLabAdapter({
     token: options.token,
     webhookSecret: options.webhookSecret,
@@ -248,14 +250,13 @@ export function gitlab(options: GitLabSync, drops: Drops): SyncProvider {
     const lower = path.toLowerCase()
     return excludedPaths.find((prefix) => lower === prefix || lower.startsWith(`${prefix}/`))
   }
-  const paths = new Map<string, Promise<string>>()
-  const pathOf = (project: number | string) => {
-    let path = paths.get(String(project))
-    if (!path) {
-      path = adapter.fetchChannelInfo(`gitlab:${project}`).then((info) => info.name ?? Promise.reject(new Error(`GitLab project ${project} has no path`)))
-      path.catch(() => paths.delete(String(project)))
-      paths.set(String(project), path)
-    }
+  const paths = new Map<string, { path: Promise<string>; until: number }>()
+  const pathOf = (project: number | string, fresh = false) => {
+    const cached = paths.get(String(project))
+    if (cached && !fresh && cached.until > Date.now()) return cached.path
+    const path = adapter.fetchChannelInfo(`gitlab:${project}`).then((info) => info.name ?? Promise.reject(new Error(`GitLab project ${project} has no path`)))
+    path.catch(() => paths.delete(String(project)))
+    paths.set(String(project), { path, until: Date.now() + PATH_TTL_MS })
     return path
   }
   const exclusion = async (hook: Hook): Promise<[DropReason, string?] | null> => {
@@ -291,7 +292,10 @@ export function gitlab(options: GitLabSync, drops: Drops): SyncProvider {
   const sync: SyncFn<ChatSdkEvent<'gitlab'>> = async (sync) => {
     if (sync.direction === 'out') {
       if (sync.target === null) return
-      const prefix = excludedPaths.length ? excludedBy(await pathOf(native(sync.key, sync.target).split(':')[0]!)) : undefined
+      const thread = noteableThread(native(sync.key, sync.target))
+      const root = await threadRoot(sync.message.id)
+      if (root.from !== sync.key || root.origin?.thread !== `${sync.key}:${thread}`) return drops.record('gitlab', 'unimported_target')
+      const prefix = excludedPaths.length ? excludedBy(await pathOf(thread.split(':')[0]!, true)) : undefined
       if (prefix) return drops.record('gitlab', 'excluded_target', prefix)
       return sync.deliver()
     }

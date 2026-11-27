@@ -63,7 +63,7 @@ export function createApp(options: AppOptions): (request: Request) => Promise<Re
     url: options.url,
     basePath,
     authenticate: async (request) => (await people(request)) ?? (await machines(request)),
-    sync: syncEntries(options.sync ?? {}, options.url, dropped),
+    sync: syncEntries(options.sync ?? {}, options.url, dropped, async (message) => (await team.thread(message)).message),
     watch: { triage: triage(options.sync?.triageChannel) },
   })
 

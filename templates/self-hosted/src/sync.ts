@@ -1,4 +1,4 @@
-import type { Watcher } from '@vercel/board'
+import type { MessageView, Watcher } from '@vercel/board'
 import type { SyncProvider } from '@vercel/board/sync'
 import type { Drops } from './drops.ts'
 import { gchat, type GoogleChatSync } from './gchat.ts'
@@ -74,9 +74,9 @@ export function syncFromEnv(env: Env): SyncOptions {
   return options
 }
 
-export function syncEntries(options: SyncOptions, boardUrl: string, drops: Drops): Record<string, SyncProvider> {
+export function syncEntries(options: SyncOptions, boardUrl: string, drops: Drops, rootOf: (message: string) => Promise<MessageView>): Record<string, SyncProvider> {
   return {
-    ...(options.gitlab ? { gitlab: gitlab(options.gitlab, drops) } : {}),
+    ...(options.gitlab ? { gitlab: gitlab(options.gitlab, drops, rootOf) } : {}),
     ...(options.gchat ? { gchat: gchat(options.gchat, `${boardUrl.replace(/\/+$/, '')}/webhooks/gchat`, drops) } : {}),
   }
 }

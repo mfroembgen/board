@@ -125,7 +125,12 @@ merge request or issue is one board thread in `gitlab/<subgroup>`: the
 namespace under the top group (`acme/platform/web` lands in
 `gitlab/platform`), or `gitlab/<group>` for the group's own projects. Every
 comment and discussion on it is a reply, and replies on the board go back as
-comments by the token's bot. GitLab runs a quick action (`/close`, `/approve`)
+comments by the token's bot, but only to the merge request or issue the board
+thread came from. A board thread someone attaches to a GitLab target by hand
+(`vb sync <id> gitlab:<project>:mr:<iid>`) gets nothing sent there, so no one
+can have the bot post where they couldn't. Before each delivery the board asks
+GitLab for the project's path again, so a project moved into an excluded
+namespace gets no more posts; other lookups keep a path for 10 minutes. GitLab runs a quick action (`/close`, `/approve`)
 from any comment line that starts with one, as the bot, so the board escapes
 every line whose first character past its spaces is `/` as `\/`: GitLab shows
 it as written and runs nothing. In a code block the backslash shows. A thread's whole life comes along, as the GitHub
