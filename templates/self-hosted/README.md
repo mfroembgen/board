@@ -164,7 +164,8 @@ merge request. Only merge request pipelines carry their merge request; a
 branch pipeline reaches no thread. An event or comment on a merge request or
 issue the board hasn't seen creates its root from the API first, with the same
 text and labels, a failing head pipeline's `ci.*` included (and `review`, for
-a root a comment brings), while it is open; one from an event is shown as by whoever caused it, or GitLab
+a root a comment brings). A comment does so whatever the item's state; a
+lifecycle event only while it is open; one from an event is shown as by whoever caused it, or GitLab
 CI for a pipeline. The mirror owns `state`, `head`, `review` and `ci.*` on
 those roots. The adapter passes
 only new public comments and their emoji: comment edits and deletes, system
