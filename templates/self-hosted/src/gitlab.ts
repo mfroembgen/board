@@ -73,7 +73,6 @@ type Noteable = {
 
 const PIPELINE_FAILED = ['failed', 'canceled']
 const APPROVAL_EVENTS = ['mr.approval', 'mr.approved', 'mr.unapproved']
-const PATH_TTL_MS = 10 * 60 * 1000
 const GITLAB_CI: ExternalAuthor = { id: 'gitlab:user:gitlab-ci', handle: 'gitlab-ci', name: 'GitLab CI', avatar: null, isBot: true }
 
 export function gitlabChannel(path: string): string {
@@ -261,14 +260,10 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
     const lower = path.toLowerCase()
     return excludedPaths.find((prefix) => lower === prefix || lower.startsWith(`${prefix}/`))
   }
-  const paths = new Map<string, { path: Promise<string>; until: number }>()
-  const pathOf = (project: number | string, fresh = false) => {
-    const cached = paths.get(String(project))
-    if (cached && !fresh && cached.until > Date.now()) return cached.path
-    const path = adapter.fetchChannelInfo(`gitlab:${project}`).then((info) => info.name ?? Promise.reject(new Error(`GitLab project ${project} has no path`)))
-    path.catch(() => paths.delete(String(project)))
-    paths.set(String(project), { path, until: Date.now() + PATH_TTL_MS })
-    return path
+  const pathOf = async (project: number | string) => {
+    const info = await adapter.fetchChannelInfo(`gitlab:${project}`)
+    if (!info.name) throw new Error(`GitLab project ${project} has no path`)
+    return info.name
   }
   const exclusion = async (hook: Hook): Promise<[DropReason, string?] | null> => {
     if (excludedPaths.length === 0) return null
@@ -278,7 +273,7 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
       if (prefix) return ['excluded_path', prefix]
     }
     for (const id of ids) {
-      const path = await pathOf(id, true).catch(() => null)
+      const path = await pathOf(id).catch(() => null)
       if (path === null) return ['unreadable_project']
       const prefix = excludedBy(path)
       if (prefix) return ['excluded_path', prefix]
@@ -322,15 +317,21 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
       const thread = noteableThread(native(sync.key, sync.target))
       const root = await threadRoot(sync.message.id)
       if (root.from !== sync.key || root.origin?.thread !== `${sync.key}:${thread}`) return drops.record('gitlab', 'unimported_target')
-      const prefix = excludedPaths.length ? excludedBy(await pathOf(thread.split(':')[0]!, true)) : undefined
+      const prefix = excludedPaths.length ? excludedBy(await pathOf(thread.split(':')[0]!)) : undefined
       if (prefix) return drops.record('gitlab', 'excluded_target', prefix)
       return sync.deliver()
     }
     const event = sync.event
     if (event.kind !== 'message' && event.kind !== 'lifecycle') return void (await sync.import())
     const [project, kind, iid] = native(sync.key, event.thread).split(':') as [string, Kind, string]
-    const channel = gitlabChannel(await pathOf(project))
-    if (event.kind === 'message') return void (await sync.import(channel))
+    const path = await pathOf(project)
+    const prefix = excludedBy(path)
+    if (prefix) return drops.record('gitlab', 'excluded_path', prefix)
+    const channel = gitlabChannel(path)
+    if (event.kind === 'message') {
+      if (kind === 'issue' && (await noteableOf(project, kind, iid)).confidential === true) return drops.record('gitlab', 'confidential')
+      return void (await sync.import(channel))
+    }
     const item = await noteableOf(project, kind, iid)
     if (item.confidential === true) return drops.record('gitlab', 'confidential')
     const overrides = await reconciled(event, project, kind, item, event.raw as Kept)

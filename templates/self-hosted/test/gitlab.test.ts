@@ -70,7 +70,8 @@ mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: Request
     bodies.push(String(init?.body ?? ''))
     return Response.json({ id: 5000 + posted.length, body: '', author: { id: 99, username: 'board', name: 'Board' }, created_at: '2026-11-27T11:00:00Z', updated_at: '2026-11-27T11:00:00Z', system: false, type: null }, { status: 201 })
   }
-  return api[path] ? Response.json(api[path]) : new Response('not found', { status: 404 })
+  const found = typeof api[path] === 'function' ? (api[path] as () => unknown)() : api[path]
+  return found ? Response.json(found) : new Response('not found', { status: 404 })
 })
 
 const gitlabSync = (excludedPaths: string[] = []): SyncOptions['gitlab'] => ({ token: 'glpat-test', webhookSecret: SECRET, apiUrl: GITLAB_API, excludedPaths })
@@ -507,6 +508,20 @@ test('an issue comment is checked against GitLab before it is stored, and a proj
   const metrics = await (await app(new Request('https://board.test/metrics'))).text()
   assert.match(metrics, /^board_sync_dropped_total\{entry="gitlab",reason="confidential"\} 1$/m)
   assert.match(metrics, /^board_sync_dropped_total\{entry="gitlab",reason="excluded_path"\} 1$/m)
+})
+
+test('a webhook whose issue turns confidential, or whose project moves into an excluded group, while it waits in the inbox stays off the board', async () => {
+  const app = board({ gitlab: gitlabSync(['acme/hiring']) })
+  const reads = { project: 0, issue: 0 }
+  api['/projects/42'] = () => projectOf(42, reads.project++ === 0 ? 'acme/platform/web' : 'acme/hiring/web')
+  await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
+  await eventually(async () => (logged.includes('[board] gitlab dropped: excluded path acme/hiring') ? true : undefined))
+
+  api['/projects/42'] = projectOf(42, 'acme/platform/web')
+  api['/projects/42/issues/3'] = () => issueItem({ confidential: reads.issue++ > 0 })
+  await gitlabHook(app, 'Note Hook', { ...note(1003, 'd3', 'see the plan'), merge_request: undefined, issue: { id: 901, iid: 3, title: 'Export page is blank' } })
+  await eventually(async () => (logged.includes('[board] gitlab dropped: confidential') ? true : undefined))
+  assert.deepEqual(await channel(app, 'gitlab/platform'), [])
 })
 
 test('a merge request whose target moved into an excluded group is dropped at once, however recently its old path was seen', async () => {

@@ -130,9 +130,10 @@ thread came from. A board thread someone attaches to a GitLab target by hand
 (`vb sync <id> gitlab:<project>:mr:<iid>`) gets nothing sent there, so no one
 can have the bot post where they couldn't. Before each delivery the board asks
 GitLab for the project's path again, so a project moved into an excluded
-namespace gets no more posts. Before the board stores a webhook, it asks too,
-for every project the webhook names, so one sent before its project moved is
-dropped; only the channel a thread lands in keeps a path for 10 minutes. GitLab runs a quick action (`/close`, `/approve`)
+namespace gets no more posts. It asks again for every project a webhook names
+before storing it, and for the thread's project before bringing it onto the
+board, so a webhook sent, or waiting in the inbox, while its project moved is
+dropped. The board keeps no path. GitLab runs a quick action (`/close`, `/approve`)
 from any comment line that starts with one, as the bot, so the board escapes
 every line whose first character past its spaces is `/` as `\/`: GitLab shows
 it as written and runs nothing. In a code block the backslash shows. A thread's whole life comes along, as the GitHub
@@ -169,9 +170,10 @@ those roots. The adapter passes
 only new public comments and their emoji: comment edits and deletes, system
 notes, and internal and confidential notes stay on GitLab. Point the webhook
 at no confidential issue events. Before it stores any webhook about an issue,
-a comment or an emoji on one included, the board reads the issue and drops the
-webhook while it is confidential, so one sent before it became confidential
-can't bring it onto the board; what the board mirrored before stays as it was.
+a comment or an emoji on one included, and again before it brings an issue's
+event or comment onto the board, the board reads the issue and drops it while
+it is confidential, so one sent before it became confidential can't bring it
+onto the board; what the board mirrored before stays as it was.
 
 **Google Chat.** The adapter reads Google Workspace add-on events, so build the
 Chat app as an add-on with the HTTP endpoint
