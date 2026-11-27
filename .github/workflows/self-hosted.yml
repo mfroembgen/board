@@ -74,6 +74,8 @@ jobs:
           digest=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           published=sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
           grep -F "image: \"$image\"" /tmp/board.yaml
+          helm template board chart "$@" --set webhookIngress.enabled=true | grep -B1 -F 'pathType: Exact' | grep -F 'path: /api/board/webhooks/gchat'
+          helm template board chart "$@" --set sync.gitlab.secretName=board-gitlab | grep -A1 -F 'name: board-gitlab' | grep -F 'optional: true'
           helm template board chart "$@" --set "image.digest=$digest" | grep -F "image: \"$image@$digest\""
           set -- "$@" --set "image.publishedDigest=$published,image.publishedImage=$image"
           helm template board chart "$@" | grep -F "image: \"$image@$published\""

@@ -23,6 +23,28 @@ ingress:
   className: ""
   annotations: {}
 
+sync:
+  gitlab:
+    secretName: ""
+    apiUrl: ""
+    excludedPaths: []
+  gchat:
+    secretName: ""
+    projectNumber: ""
+    botUserId: ""
+    spaces: {}
+    pubsub:
+      topic: ""
+      serviceAccountEmail: ""
+      impersonateUser: ""
+  triageChannel: ""
+
+webhookIngress:
+  enabled: false
+  className: ""
+  annotations: {}
+  entries: [gchat]
+
 storage:
   className: ""
   size: 5Gi

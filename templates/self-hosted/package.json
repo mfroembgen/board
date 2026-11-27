@@ -13,7 +13,10 @@
     "test": "node --test test/*.test.ts"
   },
   "dependencies": {
+    "@chat-adapter/gchat": "4.45.0",
+    "@chat-adapter/gitlab": "4.45.0",
     "@vercel/board": "0.56.1",
+    "chat": "4.45.0",
     "jose": "6.2.18",
     "srvx": "1.0.8"
   },

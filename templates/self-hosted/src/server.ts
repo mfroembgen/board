@@ -1,5 +1,6 @@
 import { serve } from 'srvx'
 import { createApp } from './app.ts'
+import { syncFromEnv } from './sync.ts'
 
 function env(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback
@@ -15,5 +16,6 @@ serve({
     dir: env('BOARD_DIR', '.board'),
     people: { issuer: env('AUTHKIT_ISSUER'), domain: env('TEAM_DOMAIN') },
     browser: { clientId: process.env.AUTHKIT_CLIENT_ID || undefined, label: process.env.SIGN_IN_LABEL || undefined },
+    sync: syncFromEnv(process.env),
   }),
 })

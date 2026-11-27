@@ -5,6 +5,7 @@ import { local } from '@vercel/board/backend-local'
 import { decodeJwt } from 'jose'
 import { browser, type BrowserOptions } from './browser.ts'
 import { authkitPeople, type PeopleOptions } from './people.ts'
+import { syncEntries, triage, type SyncOptions } from './sync.ts'
 
 export type AppOptions = {
   /** The board's public URL, which every token's audience must equal. */
@@ -15,6 +16,7 @@ export type AppOptions = {
   /** Keys for grant-named issuers, for tests. Default: each issuer's published JWKS. */
   machines?: OidcTokensOptions
   browser?: Pick<BrowserOptions, 'clientId' | 'label'>
+  sync?: SyncOptions
 }
 
 /**
@@ -59,6 +61,8 @@ export function createApp(options: AppOptions): (request: Request) => Promise<Re
     url: options.url,
     basePath,
     authenticate: async (request) => (await people(request)) ?? (await machines(request)),
+    sync: syncEntries(options.sync ?? {}, options.url),
+    watch: { triage: triage(options.sync?.triageChannel) },
   })
 
   const serve = async (request: Request) => untilExpiry(request, await team.fetch(request))

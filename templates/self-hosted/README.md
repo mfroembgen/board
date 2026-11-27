@@ -10,6 +10,7 @@ their OIDC issuer. It needs no Vercel project.
 | --- | --- |
 | `src/app.ts` | `board()` on `local()`, with `url` set and both verifiers |
 | `src/people.ts` | AuthKit access tokens minted for the board's URL as their resource, then the person's verified email from userinfo |
+| `src/sync.ts` | GitLab and Google Chat sync, each on when its secrets are set, and the triage watcher |
 | `bin/board-token.ts` | Signs a person in through the browser (PKCE, dynamic client registration) and prints a token for `vb` |
 | `chart/` | A Helm chart: one replica, `Recreate`, a kept volume |
 
@@ -94,6 +95,63 @@ error for the operator, and AuthKit's own page shows one at authorize. Then
 fix `AUTHKIT_CLIENT_ID`, or, for a registered client, delete
 `BOARD_DIR/authkit-client.json` and restart the board so it registers a new
 one.
+
+## Sync GitLab and Google Chat
+
+Each entry runs when its secret variables are set, and stays off otherwise.
+Some but not all of an entry's variables fail the start, so a typo shows at
+once. Each platform's webhook is `https://<host>/api/board/webhooks/<entry>`,
+and the adapter checks every request before the board stores it.
+
+| Variable | What it is |
+| --- | --- |
+| `GITLAB_TOKEN` | A group or project access token with the `api` scope and the Reporter role. Its bot writes the board's replies as comments |
+| `GITLAB_WEBHOOK_SECRET` | The secret token of the GitLab webhook. GitLab sends it in `X-Gitlab-Token` |
+| `GITLAB_API_URL` | Required with them: `https://gitlab.example.com/api/v4` |
+| `GITLAB_BOT_USER_ID` | Optional. The token's bot user ID. The board asks `GET /user` without it |
+| `GITLAB_EXCLUDE` | Optional. Comma-separated namespace paths, such as `acme/hiring`. Their events are answered and never stored |
+| `GOOGLE_CHAT_CREDENTIALS` | The Chat app's service account key, as JSON |
+| `GOOGLE_CHAT_PROJECT_NUMBER` | Required with it: the number of the Chat app's Google Cloud project |
+| `GOOGLE_CHAT_BOT_USER_ID` | Optional. The app's own `users/<id>` name. Without it, every bot's message counts as its own and is skipped |
+| `GOOGLE_CHAT_SPACES` | Optional. `spaces/<id>=<channel>` pairs, comma-separated. Other spaces land in `gchat/<space id>` |
+| `GOOGLE_CHAT_PUBSUB_TOPIC`, `GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL`, `GOOGLE_CHAT_IMPERSONATE_USER` | Optional, all three together: every message in a space through Workspace Events, instead of only messages that mention the app |
+| `BOARD_TRIAGE_CHANNEL` | Optional. Where the triage watcher announces each new thread from GitLab |
+
+**GitLab.** Point a group or project webhook at `/webhooks/gitlab` with
+the secret token, and the **Comments** and **Emoji events** triggers. Each
+merge request or issue is one board thread in `gitlab/<subgroup>`: the
+namespace under the top group (`acme/platform/web` lands in
+`gitlab/platform`), or `gitlab/<group>` for the group's own projects. Its root
+is the title and link, and every comment and discussion on it is a reply.
+Replies on the board go back as comments by the token's bot. The adapter
+passes only new public comments and their emoji: edits, deletes, system notes,
+internal and confidential notes stay on GitLab, and a merge request or issue
+comes over with its first comment.
+
+**Google Chat.** The adapter reads Google Workspace add-on events, so build the
+Chat app as an add-on with the HTTP endpoint
+`https://<host>/api/board/webhooks/gchat`. The board accepts only tokens Google
+signed for that URL as the app's own add-on identity,
+`service-<project number>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`. Each
+Chat thread is a board thread in its space's channel, and replies on the
+board go back to it. Direct messages to the app stay off the board. Without
+Pub/Sub, Chat sends only messages that mention the app. With it, the adapter
+subscribes each space the app joins to Workspace Events as the impersonated
+user, which needs domain-wide delegation, and Pub/Sub pushes to the same URL
+with tokens for it from that service account.
+
+**Triage.** The `triage` watcher labels every new thread from GitLab
+`status=triage`, and posts a line about it in `BOARD_TRIAGE_CHANNEL` when that
+is set. Labels never sync out, and the triage channel starts no platform
+threads, so nothing reaches GitLab. Find the queue with
+`vb read gitlab/ --label status=triage`, and take a thread off it with
+`vb label <id> status=triaged`.
+
+In the chart, `sync.gitlab.secretName` and `sync.gchat.secretName` name the
+Secrets whose keys become those variables, and each is optional, so the board
+starts before they exist. `webhookIngress` adds a second Ingress that matches
+only `/api/board/webhooks/<entry>` exactly, for a controller that faces the
+platform when the rest of the board stays private.
 
 ## Deploy it
 
