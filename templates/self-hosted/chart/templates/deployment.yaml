@@ -89,16 +89,6 @@ spec:
             - name: GOOGLE_CHAT_SPACES
               value: {{ include "board.spaces" . | quote }}
             {{- end }}
-            {{- with .Values.sync.gchat.pubsub }}
-            {{- if .topic }}
-            - name: GOOGLE_CHAT_PUBSUB_TOPIC
-              value: {{ .topic | quote }}
-            - name: GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL
-              value: {{ required "sync.gchat.pubsub.serviceAccountEmail is required with a topic" .serviceAccountEmail | quote }}
-            - name: GOOGLE_CHAT_IMPERSONATE_USER
-              value: {{ required "sync.gchat.pubsub.impersonateUser is required with a topic" .impersonateUser | quote }}
-            {{- end }}
-            {{- end }}
             {{- with .Values.sync.triageChannel }}
             - name: BOARD_TRIAGE_CHANNEL
               value: {{ . | quote }}

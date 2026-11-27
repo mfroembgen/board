@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { createGitLabAdapter, type GitLabAdapter } from '@chat-adapter/gitlab'
-import type { ExternalAuthor, ReceivedEvent, SyncFn, SyncProvider, SyncRoot } from '@vercel/board/sync'
+import type { ExternalAuthor, Receive, ReceivedEvent, SyncFn, SyncOverrides, SyncProvider, SyncRoot } from '@vercel/board/sync'
 import { chatSdk, type ChatSdkEvent } from '@vercel/board/sync-chat-sdk'
 import { segment } from './channels.ts'
 
@@ -13,7 +13,10 @@ export type GitLabSync = {
 }
 
 type Lifecycle = Extract<ReceivedEvent['event'], { kind: 'lifecycle' }>
-type Change = Omit<Lifecycle, 'kind' | 'channel' | 'thread' | 'author'> & { noteable: 'mr' | 'issue'; iid: number }
+type Kind = 'mr' | 'issue'
+type Change = Omit<Lifecycle, 'kind' | 'channel' | 'thread' | 'author'> & { kind: Kind; iid: number; project: number }
+type Pipeline = { id: number; status: string; sha: string; url: string }
+type Kept = { pipeline: Pipeline } | null
 
 type User = {
   id?: number
@@ -21,6 +24,7 @@ type User = {
   name?: string
   avatar_url?: string | null
 }
+type ProjectRef = { path_with_namespace?: string }
 type Hook = {
   user?: User
   project?: { id?: number; path_with_namespace?: string; web_url?: string }
@@ -30,15 +34,23 @@ type Hook = {
     title?: string
     url?: string
     action?: string
-    draft?: boolean
-    work_in_progress?: boolean
     oldrev?: string
-    last_commit?: { id?: string }
     status?: string
     sha?: string
+    source?: ProjectRef
+    target?: ProjectRef
+    source_project_id?: number
+    target_project_id?: number
   }
   changes?: Record<string, unknown>
-  merge_request?: { iid?: number; url?: string }
+  merge_request?: {
+    iid?: number
+    url?: string
+    source_project_id?: number
+    target_project_id?: number
+    source?: ProjectRef
+    target?: ProjectRef
+  }
 }
 type Noteable = {
   iid: number
@@ -48,10 +60,11 @@ type Noteable = {
   draft?: boolean
   sha?: string
   references?: { full?: string }
+  head_pipeline?: { id?: number; status?: string } | null
   author: User & { bot?: boolean }
 }
 
-const PIPELINE_REPORTED = ['failed', 'canceled', 'success']
+const PIPELINE_FAILED = ['failed', 'canceled']
 const GITLAB_CI: ExternalAuthor = { id: 'gitlab:user:gitlab-ci', handle: 'gitlab-ci', name: 'GitLab CI', avatar: null, isBot: true }
 
 export function gitlabChannel(path: string): string {
@@ -70,122 +83,12 @@ function authorOf(user: User | undefined): ExternalAuthor {
   return { id: `gitlab:user:${user?.id ?? handle}`, handle, name: user?.name || handle, avatar: user?.avatar_url ?? null, isBot: false }
 }
 
-function mergeRequestState(item: { state?: string; draft?: boolean; work_in_progress?: boolean }): string {
+function mergeRequestState(item: Noteable): string {
   if (item.state === 'merged' || item.state === 'closed') return item.state
-  return item.draft || item.work_in_progress ? 'draft' : 'open'
+  return item.draft ? 'draft' : 'open'
 }
 
-function mergeRequestChanges(hook: Hook, path: string, project: number): Change[] {
-  const mr = hook.object_attributes!
-  const iid = mr.iid!
-  const who = hook.user?.username ?? 'someone'
-  const sha = mr.last_commit?.id
-  const head: Record<string, string> = sha ? { head: sha } : {}
-  const state = mergeRequestState({ draft: mr.draft, work_in_progress: mr.work_in_progress })
-  const root = { mr: `${path}!${iid}`, ...head, state }
-  const base = { noteable: 'mr' as const, iid, title: `MR !${iid}: ${mr.title}`, url: mr.url ?? null, labels: {}, unset: [], reply: null, createRoot: false }
-  switch (mr.action) {
-    case 'open':
-      return [{ ...base, type: 'mr.opened', labels: root, createRoot: true }]
-    case 'reopen':
-      return [{ ...base, type: 'mr.reopened', labels: root, reply: `reopened by ${who}`, createRoot: true }]
-    case 'close':
-      return [{ ...base, type: 'mr.closed', labels: { state: 'closed' }, reply: `closed by ${who}` }]
-    case 'merge':
-      return [{ ...base, type: 'mr.merged', labels: { state: 'merged' }, reply: `merged by ${who}` }]
-    case 'approval':
-      return [{ ...base, type: 'mr.approval', reply: `approved by ${who}` }]
-    case 'approved':
-      return [{ ...base, type: 'mr.approved', labels: { review: 'approved' }, reply: `approved by ${who}` }]
-    case 'unapproved':
-      return [{ ...base, type: 'mr.unapproved', unset: ['review'] }]
-    case 'update':
-      return mergeRequestUpdates(hook.changes ?? {}, Boolean(mr.oldrev), base, root, project)
-    default:
-      return []
-  }
-}
-
-function mergeRequestUpdates(changes: Record<string, unknown>, pushed: boolean, base: Omit<Change, 'type'>, root: Record<string, string>, project: number): Change[] {
-  const updates: Change[] = []
-  if (changes.title) updates.push({ ...base, type: 'mr.edited', retitled: true })
-  if ('draft' in changes || 'work_in_progress' in changes) {
-    const ready = root.state === 'open'
-    updates.push({ ...base, type: ready ? 'mr.ready' : 'mr.draft', labels: ready ? root : { state: 'draft' }, createRoot: ready })
-  }
-  if (pushed && root.head) updates.push({ ...base, type: 'mr.synchronized', labels: { head: root.head }, owns: [ciPrefix(project, base.iid)] })
-  return updates
-}
-
-function issueChanges(hook: Hook, path: string): Change[] {
-  const issue = hook.object_attributes!
-  const iid = issue.iid!
-  const who = hook.user?.username ?? 'someone'
-  const root = { issue: `${path}#${iid}` }
-  const base = { noteable: 'issue' as const, iid, title: `Issue #${iid}: ${issue.title}`, url: issue.url ?? null, labels: {}, unset: [], reply: null, createRoot: false }
-  switch (issue.action) {
-    case 'open':
-      return [{ ...base, type: 'issue.opened', labels: { ...root, state: 'open' }, createRoot: true }]
-    case 'reopen':
-      return [{ ...base, type: 'issue.reopened', labels: { ...root, state: 'open' }, reply: `reopened by ${who}`, createRoot: true }]
-    case 'close':
-      return [{ ...base, type: 'issue.closed', labels: { state: 'closed' }, reply: `closed by ${who}` }]
-    case 'update':
-      return hook.changes?.title ? [{ ...base, type: 'issue.edited', retitled: true }] : []
-    default:
-      return []
-  }
-}
-
-function pipelineChanges(hook: Hook, path: string, project: number): Change[] {
-  const pipeline = hook.object_attributes!
-  const iid = hook.merge_request?.iid
-  const status = pipeline.status ?? ''
-  if (!iid || !PIPELINE_REPORTED.includes(status)) return []
-  const key = pipelineLabel(project, iid)
-  const failed = status !== 'success'
-  const link = pipeline.url ?? `${hook.project?.web_url}/-/pipelines/${pipeline.id}`
-  return [{
-    noteable: 'mr',
-    iid,
-    type: failed ? 'ci.failed' : 'ci.passed',
-    title: `MR !${iid}`,
-    url: hook.merge_request?.url ?? null,
-    labels: failed ? { [key]: status } : {},
-    unset: failed ? [] : [key],
-    reply: failed ? `pipeline ${status} on ${path}!${iid} at ${(pipeline.sha ?? '').slice(0, 8)}: ${link}` : null,
-    createRoot: false,
-  }]
-}
-
-const HOOKS: Record<string, (hook: Hook, path: string, project: number) => Change[]> = {
-  'Merge Request Hook': mergeRequestChanges,
-  'Issue Hook': issueChanges,
-  'Pipeline Hook': pipelineChanges,
-}
-
-export function lifecycleEvents(key: string, headers: Headers, body: string): ReceivedEvent[] {
-  const changesOf = HOOKS[headers.get('x-gitlab-event') ?? '']
-  if (!changesOf) return []
-  let hook: Hook
-  try {
-    hook = JSON.parse(body) as Hook
-  } catch {
-    return []
-  }
-  const project = hook.project?.id
-  const path = hook.project?.path_with_namespace
-  if (typeof project !== 'number' || !path || !hook.object_attributes) return []
-  const delivery = headers.get('idempotency-key') ?? headers.get('x-gitlab-event-uuid') ?? createHash('sha256').update(body).digest('base64url')
-  const author = headers.get('x-gitlab-event') === 'Pipeline Hook' ? GITLAB_CI : authorOf(hook.user)
-  return changesOf(hook, path, project).map(({ noteable, iid, ...change }, index) => ({
-    event: { kind: 'lifecycle', channel: `${key}:${project}`, thread: `${key}:${project}:${noteable}:${iid}`, author, ...change },
-    raw: hook,
-    dedupe: `lifecycle:${delivery}:${index}`,
-  }))
-}
-
-function rootOf(kind: string, item: Noteable): Omit<SyncRoot, 'raw'> {
+function rootOf(kind: Kind, item: Noteable): Omit<SyncRoot, 'raw'> {
   const author = { ...authorOf(item.author), isBot: item.author.bot === true }
   if (kind === 'mr') {
     const labels = { mr: item.references?.full ?? '', state: mergeRequestState(item), ...(item.sha ? { head: item.sha } : {}) }
@@ -195,51 +98,191 @@ function rootOf(kind: string, item: Noteable): Omit<SyncRoot, 'raw'> {
   return { text: `Issue #${item.iid}: ${item.title}\n${item.web_url}`, labels, author }
 }
 
+function mergeRequestChanges(hook: Hook, project: number): Change[] {
+  const mr = hook.object_attributes!
+  const who = hook.user?.username ?? 'someone'
+  const base = { kind: 'mr' as const, iid: mr.iid!, project, title: `MR !${mr.iid}: ${mr.title}`, url: mr.url ?? null, labels: {}, unset: [], reply: null, createRoot: true }
+  switch (mr.action) {
+    case 'open':
+      return [{ ...base, type: 'mr.opened' }]
+    case 'reopen':
+      return [{ ...base, type: 'mr.reopened', reply: `reopened by ${who}` }]
+    case 'close':
+      return [{ ...base, type: 'mr.closed', reply: `closed by ${who}` }]
+    case 'merge':
+      return [{ ...base, type: 'mr.merged', reply: `merged by ${who}` }]
+    case 'approval':
+      return [{ ...base, type: 'mr.approval', reply: `approved by ${who}` }]
+    case 'approved':
+      return [{ ...base, type: 'mr.approved', labels: { review: 'approved' }, reply: `approved by ${who}` }]
+    case 'unapproved':
+      return [{ ...base, type: 'mr.unapproved', unset: ['review'], createRoot: false }]
+    case 'update':
+      return mergeRequestUpdates(hook, base)
+    default:
+      return []
+  }
+}
+
+function mergeRequestUpdates(hook: Hook, base: Omit<Change, 'type'>): Change[] {
+  const changes = hook.changes ?? {}
+  const updates: Change[] = []
+  if (changes.title) updates.push({ ...base, type: 'mr.edited', retitled: true, createRoot: false })
+  if ('draft' in changes || 'work_in_progress' in changes) updates.push({ ...base, type: 'mr.state' })
+  if (hook.object_attributes?.oldrev) updates.push({ ...base, type: 'mr.synchronized', owns: [ciPrefix(base.project, base.iid)], createRoot: false })
+  return updates
+}
+
+function issueChanges(hook: Hook, project: number): Change[] {
+  const issue = hook.object_attributes!
+  const who = hook.user?.username ?? 'someone'
+  const base = { kind: 'issue' as const, iid: issue.iid!, project, title: `Issue #${issue.iid}: ${issue.title}`, url: issue.url ?? null, labels: {}, unset: [], reply: null, createRoot: true }
+  switch (issue.action) {
+    case 'open':
+      return [{ ...base, type: 'issue.opened' }]
+    case 'reopen':
+      return [{ ...base, type: 'issue.reopened', reply: `reopened by ${who}` }]
+    case 'close':
+      return [{ ...base, type: 'issue.closed', reply: `closed by ${who}` }]
+    case 'update':
+      return hook.changes?.title ? [{ ...base, type: 'issue.edited', retitled: true, createRoot: false }] : []
+    default:
+      return []
+  }
+}
+
+function pipelineChanges(hook: Hook, project: number): Change[] {
+  const iid = hook.merge_request?.iid
+  const status = hook.object_attributes?.status ?? ''
+  if (!iid || (status !== 'success' && !PIPELINE_FAILED.includes(status))) return []
+  const target = hook.merge_request?.target_project_id ?? project
+  const key = pipelineLabel(target, iid)
+  const failed = status !== 'success'
+  return [{
+    kind: 'mr',
+    iid,
+    project: target,
+    type: failed ? 'ci.failed' : 'ci.passed',
+    title: `MR !${iid}`,
+    url: hook.merge_request?.url ?? null,
+    labels: failed ? { [key]: status } : {},
+    unset: failed ? [] : [key],
+    reply: failed ? `pipeline ${status}` : null,
+    createRoot: failed,
+  }]
+}
+
+function pipelineOf(hook: Hook): Pipeline {
+  const pipeline = hook.object_attributes ?? {}
+  return { id: pipeline.id ?? 0, status: pipeline.status ?? '', sha: pipeline.sha ?? '', url: pipeline.url ?? `${hook.project?.web_url}/-/pipelines/${pipeline.id}` }
+}
+
+const HOOKS: Partial<Record<string, (hook: Hook, project: number) => Change[]>> = {
+  'Merge Request Hook': mergeRequestChanges,
+  'Issue Hook': issueChanges,
+  'Pipeline Hook': pipelineChanges,
+}
+
+function parsed(body: string): Hook | null {
+  try {
+    const hook = JSON.parse(body) as unknown
+    return hook && typeof hook === 'object' ? (hook as Hook) : null
+  } catch {
+    return null
+  }
+}
+
+export function lifecycleEvents(key: string, headers: Headers, body: string): ReceivedEvent[] {
+  const event = headers.get('x-gitlab-event') ?? ''
+  const changesOf = HOOKS[event]
+  const hook = changesOf ? parsed(body) : null
+  const project = hook?.project?.id
+  if (!changesOf || !hook?.object_attributes || typeof project !== 'number') return []
+  const delivery = headers.get('idempotency-key') ?? headers.get('x-gitlab-event-uuid') ?? createHash('sha256').update(body).digest('base64url')
+  const author = event === 'Pipeline Hook' ? GITLAB_CI : authorOf(hook.user)
+  const kept: Kept = event === 'Pipeline Hook' ? { pipeline: pipelineOf(hook) } : null
+  return changesOf(hook, project).map(({ kind, iid, project: target, ...change }, index) => ({
+    event: { kind: 'lifecycle', channel: `${key}:${target}`, thread: `${key}:${target}:${kind}:${iid}`, author, ...change },
+    raw: kept,
+    dedupe: `lifecycle:${delivery}:${index}`,
+  }))
+}
+
+function namedProjects(hook: Hook): { paths: string[]; ids: number[] } {
+  const refs = [hook.project, hook.object_attributes?.source, hook.object_attributes?.target, hook.merge_request?.source, hook.merge_request?.target]
+  const ids = [hook.object_attributes?.source_project_id, hook.object_attributes?.target_project_id, hook.merge_request?.source_project_id, hook.merge_request?.target_project_id]
+  return {
+    paths: refs.flatMap((ref) => (typeof ref?.path_with_namespace === 'string' ? [ref.path_with_namespace] : [])),
+    ids: ids.filter((id): id is number => typeof id === 'number' && id !== hook.project?.id),
+  }
+}
+
 function sameSecret(expected: string, given: string | null): boolean {
   if (!given) return false
   const digest = (value: string) => createHash('sha256').update(value).digest()
   return timingSafeEqual(digest(expected), digest(given))
 }
 
-function excludedPath(body: string, excludedPaths: string[]): boolean {
-  let path: unknown
-  try {
-    path = (JSON.parse(body) as Hook).project?.path_with_namespace
-  } catch {
-    return false
-  }
-  return typeof path === 'string' && excludedPaths.some((prefix) => path === prefix || (path as string).startsWith(`${prefix}/`))
-}
+const keptOnly = (emit: Receive): Receive => (received) => emit({ ...received, raw: received.event.kind === 'lifecycle' ? received.raw : null })
 
 export function gitlab(options: GitLabSync): SyncProvider {
   const adapter: GitLabAdapter = createGitLabAdapter({
     token: options.token,
     webhookSecret: options.webhookSecret,
+    webhookSigningToken: '',
     apiUrl: options.apiUrl,
     ...(options.botUserId ? { botUserId: options.botUserId } : {}),
   })
+  const excludedPaths = options.excludedPaths ?? []
+  const isExcluded = (path: string) => excludedPaths.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))
   const paths = new Map<string, Promise<string>>()
-  const pathOf = (project: string) => {
-    let path = paths.get(project)
+  const pathOf = (project: number | string) => {
+    let path = paths.get(String(project))
     if (!path) {
       path = adapter.fetchChannelInfo(`gitlab:${project}`).then((info) => info.name ?? Promise.reject(new Error(`GitLab project ${project} has no path`)))
-      path.catch(() => paths.delete(project))
-      paths.set(project, path)
+      path.catch(() => paths.delete(String(project)))
+      paths.set(String(project), path)
     }
     return path
   }
-  const isHeadPipeline = async (project: string, iid: string, raw: unknown) => {
-    const mr = await adapter.request<{ head_pipeline?: { id?: number } | null }>('GET', `/projects/${project}/merge_requests/${iid}`)
-    return mr.head_pipeline?.id !== undefined && mr.head_pipeline.id === (raw as Hook).object_attributes?.id
+  const anyExcluded = async (hook: Hook) => {
+    if (excludedPaths.length === 0) return false
+    const { paths: named, ids } = namedProjects(hook)
+    if (named.some(isExcluded)) return true
+    for (const id of ids) {
+      const path = await pathOf(id).catch(() => null)
+      if (path === null || isExcluded(path)) return true
+    }
+    return false
+  }
+  const noteableOf = (project: string, kind: string, iid: string) =>
+    adapter.request<Noteable>('GET', `/projects/${project}/${kind === 'mr' ? 'merge_requests' : 'issues'}/${iid}`)
+
+  const reconciled = (event: Lifecycle, kind: Kind, item: Noteable, kept: Kept): SyncOverrides | null => {
+    const current = rootOf(kind, item)
+    const state = kind === 'mr' ? { state: current.labels.state!, ...(item.sha ? { head: item.sha } : {}) } : { state: current.labels.state! }
+    const overrides: SyncOverrides = { labels: { ...event.labels, ...state }, root: () => ({ text: current.text, labels: current.labels }) }
+    if (!event.type.startsWith('ci.')) return overrides
+    const head = item.head_pipeline
+    const pipeline = kept?.pipeline
+    if (!pipeline || head?.id !== pipeline.id || PIPELINE_FAILED.includes(head.status ?? '') !== PIPELINE_FAILED.includes(pipeline.status)) return null
+    if (event.type === 'ci.passed') return overrides
+    return { ...overrides, text: `pipeline ${pipeline.status} on ${item.references?.full ?? `!${item.iid}`} at ${pipeline.sha.slice(0, 8)}: ${pipeline.url}` }
   }
 
   const sync: SyncFn<ChatSdkEvent<'gitlab'>> = async (sync) => {
-    if (sync.direction === 'out') return sync.target === null ? undefined : sync.deliver()
+    if (sync.direction === 'out') {
+      if (sync.target === null) return
+      if (excludedPaths.length && isExcluded(await pathOf(native(sync.key, sync.target).split(':')[0]!))) return
+      return sync.deliver()
+    }
     const event = sync.event
     if (event.kind !== 'message' && event.kind !== 'lifecycle') return void (await sync.import())
-    const [project, , iid] = native(sync.key, event.thread).split(':') as [string, string, string]
-    if (event.kind === 'lifecycle' && event.type.startsWith('ci.') && !(await isHeadPipeline(project, iid, event.raw))) return
-    await sync.import(gitlabChannel(await pathOf(project)))
+    const [project, kind, iid] = native(sync.key, event.thread).split(':') as [string, Kind, string]
+    const channel = gitlabChannel(await pathOf(project))
+    if (event.kind === 'message') return void (await sync.import(channel))
+    const overrides = reconciled(event, kind, await noteableOf(project, kind, iid), event.raw as Kept)
+    if (overrides) await sync.import(channel, overrides)
   }
 
   const provider = chatSdk(
@@ -249,21 +292,20 @@ export function gitlab(options: GitLabSync): SyncProvider {
       groupThread: noteableThread,
       intercept: lifecycleEvents,
       fetchRoot: async (thread) => {
-        const [project, kind, iid] = thread.split(':')
-        const item = await adapter.request<Noteable>('GET', `/projects/${project}/${kind === 'mr' ? 'merge_requests' : 'issues'}/${iid}`)
-        return rootOf(kind!, item)
+        const [project, kind, iid] = thread.split(':') as [string, Kind, string]
+        return rootOf(kind, await noteableOf(project, kind, iid))
       },
     },
     sync,
   )
 
-  const excludedPaths = options.excludedPaths ?? []
-  if (excludedPaths.length === 0) return provider
   const receive = provider.receive.bind(provider)
   provider.receive = async (key, request, emit) => {
-    const body = await request.clone().text()
-    if (excludedPath(body, excludedPaths) && sameSecret(options.webhookSecret, request.headers.get('x-gitlab-token'))) return new Response('ok')
-    return receive(key, request, emit)
+    if (sameSecret(options.webhookSecret, request.headers.get('x-gitlab-token'))) {
+      const hook = parsed(await request.clone().text())
+      if (hook && (await anyExcluded(hook))) return new Response('ok')
+    }
+    return receive(key, request, keptOnly(emit))
   }
   return provider
 }

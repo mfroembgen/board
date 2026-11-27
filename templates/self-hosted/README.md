@@ -100,8 +100,10 @@ one.
 
 Each entry runs when its secret variables are set, and stays off otherwise.
 Some but not all of an entry's variables fail the start, so a typo shows at
-once. Each platform's webhook is `https://<host>/api/board/webhooks/<entry>`,
-and the adapter checks every request before the board stores it.
+once. Each platform's webhook is `https://<host>/api/board/webhooks/<entry>`.
+The board checks every request before it stores anything, and stores each event
+without the platform's payload, so pipeline variables and Chat's credentials
+never reach the inbox.
 
 | Variable | What it is |
 | --- | --- |
@@ -109,12 +111,11 @@ and the adapter checks every request before the board stores it.
 | `GITLAB_WEBHOOK_SECRET` | The secret token of the GitLab webhook. GitLab sends it in `X-Gitlab-Token` |
 | `GITLAB_API_URL` | Required with them: `https://gitlab.example.com/api/v4` |
 | `GITLAB_BOT_USER_ID` | Optional. The token's bot user ID. The board asks `GET /user` without it |
-| `GITLAB_EXCLUDE` | Optional. Comma-separated namespace paths, such as `acme/hiring`. Their events are answered and never stored |
+| `GITLAB_EXCLUDE` | Optional. Comma-separated namespace paths, such as `acme/hiring`. An event that names a project in one, as its project, a merge request's source or target, or a pipeline's merge request, is answered and never stored, and the board never posts to their merge requests or issues |
 | `GOOGLE_CHAT_CREDENTIALS` | The Chat app's service account key, as JSON |
 | `GOOGLE_CHAT_PROJECT_NUMBER` | Required with it: the number of the Chat app's Google Cloud project |
 | `GOOGLE_CHAT_BOT_USER_ID` | Optional. The app's own `users/<id>` name. Without it, every bot's message counts as its own and is skipped |
 | `GOOGLE_CHAT_SPACES` | Optional. `spaces/<id>=<channel>` pairs, comma-separated. Other spaces land in `gchat/<space id>` |
-| `GOOGLE_CHAT_PUBSUB_TOPIC`, `GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL`, `GOOGLE_CHAT_IMPERSONATE_USER` | Optional, all three together: every message in a space through Workspace Events, instead of only messages that mention the app |
 | `BOARD_TRIAGE_CHANNEL` | Optional. Where the triage watcher announces each new thread from GitLab |
 
 **GitLab.** Point a group or project webhook at `/webhooks/gitlab` with the
@@ -131,22 +132,29 @@ sync's does:
 | --- | --- |
 | Merge request opened | A root `MR !<iid>: <title>` with its link, labelled `mr=<project path>!<iid>`, `head=<sha>` and `state=open` or `state=draft` |
 | New commits | Sets `head` and unsets the merge request's `ci.<project ID>-<iid>.*`, with no reply |
-| Marked ready or draft | Sets `state`; ready creates the root if the board hasn't seen it |
+| Marked ready or draft | Sets `state` |
 | Title changed | Edits the root to say the new title |
 | Approved by someone | A reply ("approved by ada"). The approval that completes it also sets `review=approved`, and losing that unsets it |
 | Merged, closed | A reply ("merged by julian", "closed by ada") and `state=merged` or `state=closed` |
-| Reopened | A reply ("reopened by ada") and `state=open` or `state=draft`, creating the root if needed |
+| Reopened | A reply ("reopened by ada") and `state=open` or `state=draft` |
 | Pipeline failed or canceled | A reply from GitLab CI ("pipeline failed on acme/platform/web!7 at a1b2c3d4: <link>") and `ci.<project ID>-<iid>.pipeline=failed` or `canceled` |
 | Pipeline succeeded | Unsets `ci.<project ID>-<iid>.pipeline`, with no reply |
 | Issue opened | A root `Issue #<iid>: <title>` with its link, labelled `issue=<project path>#<iid>` and `state=open` |
 | Issue closed, reopened | A reply ("closed by ada", "reopened by ada") and `state` |
 
-A pipeline counts only when it is the merge request's head pipeline, which the
-board asks GitLab for, so a run a newer push superseded stays off the thread.
-Only merge request pipelines carry their merge request; a branch pipeline
-reaches no thread. A comment on a merge request or issue the board hasn't seen
-creates its root from the API first, with the same text and labels. The mirror
-owns `state`, `head`, `review` and `ci.*` on those roots. The adapter passes
+GitLab delivers webhooks out of order and again on failure, so for each of
+these events the board reads the merge request or issue from the API and sets
+`state` and `head` as GitLab has them now: a close that arrives after the
+reopen still replies, but leaves the state open. A pipeline counts only while
+it is the merge request's head pipeline with the status the event names, so a
+run a newer push superseded, or a failure GitLab has since retried to
+success, stays off the thread. A fork's pipeline lands on the target project's
+merge request. Only merge request pipelines carry their merge request; a
+branch pipeline reaches no thread. An event or comment on a merge request or
+issue the board hasn't seen creates its root from the API first, with the same
+text and labels; one from an event is shown as by whoever caused it, or GitLab
+CI for a pipeline. The mirror owns `state`, `head`, `review` and `ci.*` on
+those roots. The adapter passes
 only new public comments and their emoji: comment edits and deletes, system
 notes, and internal and confidential notes stay on GitLab.
 
@@ -154,13 +162,14 @@ notes, and internal and confidential notes stay on GitLab.
 Chat app as an add-on with the HTTP endpoint
 `https://<host>/api/board/webhooks/gchat`. The board accepts only tokens Google
 signed for that URL as the app's own add-on identity,
-`service-<project number>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`. Each
-Chat thread is a board thread in its space's channel, and replies on the
-board go back to it. Direct messages to the app stay off the board. Without
-Pub/Sub, Chat sends only messages that mention the app. With it, the adapter
-subscribes each space the app joins to Workspace Events as the impersonated
-user, which needs domain-wide delegation, and Pub/Sub pushes to the same URL
-with tokens for it from that service account.
+`service-<project number>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`: not
+Chat's shared identity, and not a token for the project number. A refused
+request logs only why, never the token. Each Chat thread is a board thread in
+its space's channel, and replies on the board go back to it. Direct messages
+to the app are answered and never stored. Chat sends the app only messages
+that mention it; every message in a space would need Workspace Events through
+Pub/Sub, whose subscriptions lapse unless renewed, and this board refuses
+Pub/Sub pushes until it renews them.
 
 **Triage.** The `triage` watcher labels every new root from GitLab
 `status=triage`, never a reply or a label change, and posts a line about it in `BOARD_TRIAGE_CHANNEL` when that

@@ -33,10 +33,6 @@ sync:
     projectNumber: ""
     botUserId: ""
     spaces: {}
-    pubsub:
-      topic: ""
-      serviceAccountEmail: ""
-      impersonateUser: ""
   triageChannel: ""
 
 webhookIngress:
