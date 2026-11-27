@@ -38,6 +38,13 @@ const issueItem = (extra: Record<string, unknown> = {}) => ({
 
 let api: Record<string, unknown> = {}
 const posted: string[] = []
+const bodies: string[] = []
+const logged: string[] = []
+const info = console.info.bind(console)
+mock.method(console, 'info', (...args: unknown[]) => {
+  logged.push(args.join(' '))
+  info(...args)
+})
 beforeEach(() => {
   api = {
     '/user': { id: 99, username: 'board', name: 'Board' },
@@ -49,6 +56,7 @@ beforeEach(() => {
     '/projects/42/issues/3': issueItem(),
   }
   posted.length = 0
+  bodies.length = 0
 })
 const setItem = (path: string, extra: Record<string, unknown>) => void (api[path] = { ...(api[path] as object), ...extra })
 
@@ -58,6 +66,7 @@ mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: Request
   const path = new URL(url).pathname.slice(new URL(GITLAB_API).pathname.length)
   if ((init?.method ?? 'GET') !== 'GET') {
     posted.push(path)
+    bodies.push(String(init?.body ?? ''))
     return Response.json({ id: 5000 + posted.length, body: '', author: { id: 99, username: 'board', name: 'Board' }, created_at: '2026-11-27T11:00:00Z', updated_at: '2026-11-27T11:00:00Z', system: false, type: null }, { status: 201 })
   }
   return api[path] ? Response.json(api[path]) : new Response('not found', { status: 404 })
@@ -219,6 +228,14 @@ test('an excluded namespace is answered and never stored, wherever the payload n
   assert.equal((await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))).status, 200)
   await mergeRequestRoot(app)
   assert.equal((await inbox(app, 'gitlab')).length, 1)
+
+  const metrics = await (await app(new Request('https://board.test/metrics'))).text()
+  assert.match(metrics, /^board_sync_dropped_total\{entry="gitlab",reason="excluded_path"\} 5$/m)
+  assert.match(metrics, /^board_sync_dropped_total\{entry="gitlab",reason="unreadable_project"\} 1$/m)
+  assert.match(metrics, /^board_sync_dropped_total\{entry="gitlab",reason="unsigned"\} 1$/m)
+  assert.match(metrics, /^board_sync_excluded_paths\{entry="gitlab"\} 1$/m)
+  assert.ok(logged.some((line) => line === '[board] gitlab dropped: excluded path acme/hiring'))
+  assert.ok(!logged.some((line) => line.includes('candidate notes') || line.includes('pipeline')))
 })
 
 test('exclusions match namespaces whatever their case', async () => {
@@ -242,6 +259,24 @@ test('a board thread synced to an excluded merge request never posts there', asy
   await eventually(async () => (posted.some((path) => path.startsWith('/projects/42/')) ? true : undefined))
   await new Promise((resolve) => setTimeout(resolve, 200))
   assert.deepEqual(posted.filter((path) => path.startsWith('/projects/50/')), [])
+  assert.ok(logged.some((line) => line === '[board] gitlab dropped: excluded target acme/hiring'))
+  assert.match(await (await app(new Request('https://board.test/metrics'))).text(), /^board_sync_dropped_total\{entry="gitlab",reason="excluded_target"\} [1-9]/m)
+})
+
+test('a reply sent to GitLab runs no quick action, whichever line it puts one on', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
+  const root = await mergeRequestRoot(app)
+  await asAda(app, 'POST', '/messages', { re: root.id, text: '/close\nthanks\n  /label ~bug\n\n/approve' })
+  const sent = await eventually(async () => bodies.find((body) => body.includes('thanks')))
+  const markdown = (JSON.parse(sent) as { body: string }).body
+  assert.doesNotMatch(markdown, /^\s*\//m)
+  assert.equal(markdown, '**ada**: /close\nthanks\n  \\/label ~bug\n\n\\/approve')
+
+  const reply = (await thread(app, root.id)).replies.find((message) => message.text.startsWith('/close'))!
+  await asAda(app, 'POST', `/messages/${reply.id}/edit`, { text: 'thanks\n/merge' })
+  const edited = await eventually(async () => bodies.find((body) => body.includes('merge')))
+  assert.equal((JSON.parse(edited) as { body: string }).body, '**ada**: thanks\n\\/merge')
 })
 
 test('a new thread from GitLab is labelled for triage and announced', async () => {

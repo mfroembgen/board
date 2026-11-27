@@ -2,6 +2,7 @@ import { createGoogleChatAdapter } from '@chat-adapter/gchat'
 import type { Receive, SyncProvider } from '@vercel/board/sync'
 import { channels, chatSdk } from '@vercel/board/sync-chat-sdk'
 import { createRemoteJWKSet, jwtVerify } from 'jose'
+import type { Drops } from './drops.ts'
 
 export type GoogleChatSync = {
   credentials: { client_email: string; private_key: string }
@@ -16,11 +17,6 @@ type AddOnEvent = {
 
 const GOOGLE_ISSUERS = ['https://accounts.google.com', 'accounts.google.com']
 const googleKeys = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'))
-
-const refused = (reason: string) => {
-  console.warn(`[board] gchat webhook refused: ${reason}`)
-  return new Response('Unauthorized', { status: 401 })
-}
 
 async function callerRefusal(request: Request, endpointUrl: string, identity: string): Promise<string | null> {
   const header = request.headers.get('authorization') ?? ''
@@ -49,7 +45,7 @@ const isDirectMessage = (event: AddOnEvent) => {
 
 const withoutRaw = (emit: Receive): Receive => (received) => emit({ ...received, raw: null })
 
-export function gchat(options: GoogleChatSync, endpointUrl: string): SyncProvider {
+export function gchat(options: GoogleChatSync, endpointUrl: string, drops: Drops): SyncProvider {
   const identity = `service-${options.projectNumber}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`
   const adapter = createGoogleChatAdapter({
     credentials: options.credentials,
@@ -69,8 +65,14 @@ export function gchat(options: GoogleChatSync, endpointUrl: string): SyncProvide
     const event = parsed(await request.clone().text())
     if (!event) return new Response('Invalid JSON', { status: 400 })
     const refusal = await callerRefusal(request, endpointUrl, identity)
-    if (refusal) return refused(refusal)
-    if (isDirectMessage(event)) return Response.json({})
+    if (refusal) {
+      drops.record('gchat', 'refused_token', refusal)
+      return new Response('Unauthorized', { status: 401 })
+    }
+    if (isDirectMessage(event)) {
+      drops.record('gchat', 'direct_message')
+      return Response.json({})
+    }
     return receive(key, request, withoutRaw(emit))
   }
   return provider

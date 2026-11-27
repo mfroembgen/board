@@ -125,7 +125,10 @@ merge request or issue is one board thread in `gitlab/<subgroup>`: the
 namespace under the top group (`acme/platform/web` lands in
 `gitlab/platform`), or `gitlab/<group>` for the group's own projects. Every
 comment and discussion on it is a reply, and replies on the board go back as
-comments by the token's bot. A thread's whole life comes along, as the GitHub
+comments by the token's bot. GitLab runs a quick action (`/close`, `/approve`)
+from any comment line that starts with one, as the bot, so the board escapes
+every line whose first character past its spaces is `/` as `\/`: GitLab shows
+it as written and runs nothing. In a code block the backslash shows. A thread's whole life comes along, as the GitHub
 sync's does:
 
 | GitLab event | What the board does |
@@ -180,6 +183,14 @@ is set. Labels never sync out, and the triage channel starts no platform
 threads, so nothing reaches GitLab. Find the queue with
 `vb read gitlab/ --label status=triage`, and take a thread off it with
 `vb label <id> status=triaged`.
+
+**Drops.** Each webhook the board refuses or answers without storing, and each
+delivery it skips, is logged with its reason and, for an exclusion, the
+excluded path, never the payload: `[board] gitlab dropped: excluded path
+acme/hiring`. At start, the board logs what each entry excludes. `GET /metrics`
+counts them by entry and reason in `board_sync_dropped_total`, with
+`board_sync_excluded_paths` for how many paths each entry excludes, so a change
+that switches an exclusion off shows as a drop to 0.
 
 In the chart, `sync.gitlab.secretName` and `sync.gchat.secretName` name the
 Secrets whose keys become those variables, and each is optional, so the board

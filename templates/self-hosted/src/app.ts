@@ -5,6 +5,7 @@ import { local } from '@vercel/board/backend-local'
 import { decodeJwt } from 'jose'
 import { browser, type BrowserOptions } from './browser.ts'
 import { authkitPeople, type PeopleOptions } from './people.ts'
+import { drops } from './drops.ts'
 import { syncEntries, triage, type SyncOptions } from './sync.ts'
 
 export type AppOptions = {
@@ -56,12 +57,13 @@ export function createApp(options: AppOptions): (request: Request) => Promise<Re
   const people = authkitPeople({ ...options.people, audience: options.url })
   // CI jobs and pods: OIDC tokens for the board's URL from an issuer a grant names, with what that grant gives.
   const machines = oidcTokens(options.machines)
+  const dropped = drops()
   const team = board({
     backend: local(typeof options.dir === 'string' ? { dir: options.dir } : options.dir),
     url: options.url,
     basePath,
     authenticate: async (request) => (await people(request)) ?? (await machines(request)),
-    sync: syncEntries(options.sync ?? {}, options.url),
+    sync: syncEntries(options.sync ?? {}, options.url, dropped),
     watch: { triage: triage(options.sync?.triageChannel) },
   })
 
@@ -79,6 +81,7 @@ export function createApp(options: AppOptions): (request: Request) => Promise<Re
   return async (request) => {
     const { pathname } = new URL(request.url)
     if (pathname === '/healthz') return new Response('ok')
+    if (pathname === '/metrics') return new Response(dropped.metrics(), { headers: { 'content-type': 'text/plain; version=0.0.4' } })
     if (pathname === basePath || pathname.startsWith(`${basePath}/`)) return serve(request)
     return page(request)
   }

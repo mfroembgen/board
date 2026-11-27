@@ -3,6 +3,7 @@ import { createGitLabAdapter, type GitLabAdapter } from '@chat-adapter/gitlab'
 import type { ExternalAuthor, Receive, ReceivedEvent, SyncFn, SyncOverrides, SyncProvider, SyncRoot } from '@vercel/board/sync'
 import { chatSdk, type ChatSdkEvent } from '@vercel/board/sync-chat-sdk'
 import { segment } from './channels.ts'
+import type { DropReason, Drops } from './drops.ts'
 
 export type GitLabSync = {
   token: string
@@ -229,9 +230,11 @@ function sameSecret(expected: string, given: string | null): boolean {
   return timingSafeEqual(digest(expected), digest(given))
 }
 
+const withoutQuickActions = (markdown: string) => markdown.replace(/^(\s*)\//gm, '$1\\/')
+
 const keptOnly = (emit: Receive): Receive => (received) => emit({ ...received, raw: received.event.kind === 'lifecycle' ? received.raw : null })
 
-export function gitlab(options: GitLabSync): SyncProvider {
+export function gitlab(options: GitLabSync, drops: Drops): SyncProvider {
   const adapter: GitLabAdapter = createGitLabAdapter({
     token: options.token,
     webhookSecret: options.webhookSecret,
@@ -240,9 +243,10 @@ export function gitlab(options: GitLabSync): SyncProvider {
     ...(options.botUserId ? { botUserId: options.botUserId } : {}),
   })
   const excludedPaths = (options.excludedPaths ?? []).map((path) => path.toLowerCase())
-  const isExcluded = (path: string) => {
+  drops.exclusions('gitlab', excludedPaths)
+  const excludedBy = (path: string) => {
     const lower = path.toLowerCase()
-    return excludedPaths.some((prefix) => lower === prefix || lower.startsWith(`${prefix}/`))
+    return excludedPaths.find((prefix) => lower === prefix || lower.startsWith(`${prefix}/`))
   }
   const paths = new Map<string, Promise<string>>()
   const pathOf = (project: number | string) => {
@@ -254,15 +258,20 @@ export function gitlab(options: GitLabSync): SyncProvider {
     }
     return path
   }
-  const anyExcluded = async (hook: Hook) => {
-    if (excludedPaths.length === 0) return false
+  const exclusion = async (hook: Hook): Promise<[DropReason, string?] | null> => {
+    if (excludedPaths.length === 0) return null
     const { paths: named, ids } = namedProjects(hook)
-    if (named.some(isExcluded)) return true
+    for (const path of named) {
+      const prefix = excludedBy(path)
+      if (prefix) return ['excluded_path', prefix]
+    }
     for (const id of ids) {
       const path = await pathOf(id).catch(() => null)
-      if (path === null || isExcluded(path)) return true
+      if (path === null) return ['unreadable_project']
+      const prefix = excludedBy(path)
+      if (prefix) return ['excluded_path', prefix]
     }
-    return false
+    return null
   }
   const noteableOf = (project: string, kind: string, iid: string) =>
     adapter.request<Noteable>('GET', `/projects/${project}/${kind === 'mr' ? 'merge_requests' : 'issues'}/${iid}`)
@@ -282,7 +291,8 @@ export function gitlab(options: GitLabSync): SyncProvider {
   const sync: SyncFn<ChatSdkEvent<'gitlab'>> = async (sync) => {
     if (sync.direction === 'out') {
       if (sync.target === null) return
-      if (excludedPaths.length && isExcluded(await pathOf(native(sync.key, sync.target).split(':')[0]!))) return
+      const prefix = excludedPaths.length ? excludedBy(await pathOf(native(sync.key, sync.target).split(':')[0]!)) : undefined
+      if (prefix) return drops.record('gitlab', 'excluded_target', prefix)
       return sync.deliver()
     }
     const event = sync.event
@@ -310,11 +320,21 @@ export function gitlab(options: GitLabSync): SyncProvider {
 
   const receive = provider.receive.bind(provider)
   provider.receive = async (key, request, emit) => {
-    if (sameSecret(options.webhookSecret, request.headers.get('x-gitlab-token'))) {
-      const hook = parsed(await request.clone().text())
-      if (hook && (await anyExcluded(hook))) return new Response('ok')
+    if (!sameSecret(options.webhookSecret, request.headers.get('x-gitlab-token'))) {
+      drops.record('gitlab', 'unsigned')
+      return receive(key, request, keptOnly(emit))
+    }
+    const hook = parsed(await request.clone().text())
+    const dropped = hook ? await exclusion(hook) : null
+    if (dropped) {
+      drops.record('gitlab', ...dropped)
+      return new Response('ok')
     }
     return receive(key, request, keptOnly(emit))
   }
+  const post = provider.post.bind(provider)
+  provider.post = (target, kind, body) => post(target, kind, { ...body, markdown: withoutQuickActions(body.markdown) })
+  const edit = provider.edit.bind(provider)
+  provider.edit = (thread, message, body) => edit(thread, message, { ...body, markdown: withoutQuickActions(body.markdown) })
   return provider
 }

@@ -115,7 +115,7 @@ test('a refused token never reaches the logs', async () => {
   const app = board({ gchat: gchatSync })
   const presented = ['opaque-credential-0f3a9c', `${(await token()).slice(0, -8)}AAAAAAAA`]
   for (const credential of presented) assert.equal((await hook(app, chatEvent(), `Bearer ${credential}`)).status, 401)
-  assert.ok(logged.some((line) => line.includes('gchat webhook refused')))
+  assert.ok(logged.some((line) => line.includes('gchat dropped: refused token')))
   for (const credential of presented) assert.ok(!logged.some((line) => line.includes(credential)), `logs hold ${credential.slice(0, 12)}…`)
 })
 
@@ -132,6 +132,7 @@ test('a direct message to the app is answered and never stored, even from a spac
   const dm = chatEvent({ space: { name: 'spaces/DDDD', type: 'DM', spaceType: 'DIRECT_MESSAGE' } })
   assert.equal((await hook(app, dm, `Bearer ${await token()}`)).status, 200)
   assert.deepEqual(await inbox(app, 'gchat'), [])
+  assert.match(await (await app(new Request('https://board.test/metrics'))).text(), /^board_sync_dropped_total\{entry="gchat",reason="direct_message"\} 1$/m)
 })
 
 test('a Pub/Sub push is refused, whatever the environment says, since the board subscribes to no space', async () => {
