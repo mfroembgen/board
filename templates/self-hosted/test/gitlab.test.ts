@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { beforeEach, mock, test } from 'node:test'
 import { syncFromEnv, type SyncOptions } from '../src/sync.ts'
-import { asAda, board, channel, eventually, inbox, thread, until, URL_, type App } from './sync-board.ts'
+import { asAda, board, channel, eventually, inbox, read, thread, until, URL_, type App } from './sync-board.ts'
 
 const GITLAB_API = 'https://gitlab.test/api/v4'
 const SECRET = 'gitlab-webhook-secret'
@@ -112,6 +112,20 @@ function note(id: number, discussion: string, text: string, options: { path?: st
 function issueNote(id: number, discussion: string, text: string) {
   const comment = note(id, discussion, text)
   return { ...comment, object_attributes: { ...comment.object_attributes, noteable_type: 'Issue' }, merge_request: undefined, issue: { id: 901, iid: 3, title: 'Export page is blank' } }
+}
+
+function emoji(noteId: number, name: string) {
+  const comment = note(noteId, 'd1', '')
+  return {
+    object_kind: 'emoji',
+    event_type: 'award',
+    user: person('bo'),
+    project_id: 42,
+    project: comment.project,
+    object_attributes: { name, awardable_type: 'Note', awardable_id: noteId, action: 'award' },
+    note: { ...comment.object_attributes, noteable_type: 'MergeRequest' },
+    merge_request: comment.merge_request,
+  }
 }
 
 function mergeRequest(action: string, extra: { by?: string; iid?: number; oldrev?: string; changes?: object; path?: string; source?: string; state?: string } = {}) {
@@ -532,13 +546,36 @@ test('a webhook whose issue turns confidential, or whose project moves into an e
   assert.deepEqual(await channel(app, 'gitlab/platform'), [])
 })
 
-test('a root GitLab returns for an issue that has turned confidential names no title', async () => {
+test('a comment whose issue turns confidential just before its root is made stays off the board, comment and all', async () => {
   const app = board({ gitlab: gitlabSync() })
+  const start = logged.length
   const reads = { issue: 0 }
   api['/projects/42/issues/3'] = () => issueItem(++reads.issue <= 2 ? {} : { confidential: true, title: 'Layoffs in the platform team' })
   await gitlabHook(app, 'Note Hook', issueNote(1003, 'd3', 'see the plan'))
-  const root = await eventually(async () => (await channel(app, 'gitlab/platform')).find((message) => message.re === null))
-  assert.equal(root.text, 'Issue #3: (confidential)\nhttps://gitlab.test/acme/platform/web/-/issues/3')
+  await eventually(async () => (logged.slice(start).includes('[board] gitlab dropped: confidential') ? true : undefined), 15000)
+  assert.deepEqual(await channel(app, 'gitlab/platform'), [])
+})
+
+test('a queued emoji, or a fork pipeline whose fork moved, stays off the board once its project is excluded', async () => {
+  const app = board({ gitlab: gitlabSync(['acme/hiring']) })
+  await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
+  const root = await mergeRequestRoot(app)
+  const comment = (await until(app, root.id, ({ replies }) => replies.length === 1)).replies[0]!
+  const start = logged.length
+  const reads = { project: 0 }
+  api['/projects/42'] = () => projectOf(42, reads.project++ === 0 ? 'acme/platform/web' : 'acme/hiring/web')
+  await gitlabHook(app, 'Emoji Hook', emoji(1001, 'thumbsup'))
+  await eventually(async () => (logged.slice(start).includes('[board] gitlab dropped: excluded path acme/hiring') ? true : undefined))
+  assert.deepEqual((await read<{ message: { reactions?: object } }>(app, `/messages/${comment.id}`)).message.reactions ?? {}, {})
+
+  api['/projects/42'] = projectOf(42, 'acme/platform/web')
+  const forkReads = { project: 0 }
+  api['/projects/77'] = () => projectOf(77, forkReads.project++ === 0 ? 'acme/forks/web' : 'acme/hiring/web')
+  setItem('/projects/42/merge_requests/7', { head_pipeline: { id: 400, status: 'failed', sha: 'a1b2c3d4e5f6a7b8' } })
+  const before = logged.length
+  await gitlabHook(app, 'Pipeline Hook', pipeline(400, 'failed', { project: { id: 77, path: 'acme/forks/web' }, target: 42 }))
+  await eventually(async () => (logged.slice(before).includes('[board] gitlab dropped: excluded path acme/hiring') ? true : undefined))
+  assert.equal((await thread(app, root.id)).message.labels['ci.42-7.pipeline'], undefined)
 })
 
 test('a merge request whose target moved into an excluded group is dropped at once, however recently its old path was seen', async () => {

@@ -172,10 +172,11 @@ notes, and internal and confidential notes stay on GitLab. Point the webhook
 at no confidential issue events. Before it stores any webhook about an issue,
 a comment or an emoji on one included, and again before it brings an issue's
 event or comment onto the board, the board reads the issue and drops it while
-it is confidential, and a root it makes for an issue GitLab reports as
-confidential says `(confidential)` in place of the title, so one sent before
-it became confidential can't bring it onto the board; what the board mirrored
-before stays as it was.
+it is confidential, and an import whose root lookup finds it confidential
+fails and is dropped on its retry, so one sent before it became confidential
+can't bring it onto the board; what the board mirrored before stays as it was.
+The project checks run for every event a webhook brings, emoji included, and
+for a fork's pipeline cover the fork as well as the target.
 
 **Google Chat.** The adapter reads Google Workspace add-on events, so build the
 Chat app as an add-on with the HTTP endpoint

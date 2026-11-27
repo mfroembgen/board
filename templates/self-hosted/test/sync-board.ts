@@ -51,8 +51,8 @@ export const channel = async (app: App, path: string) => (await read<{ messages:
 export const inbox = async (app: App, key: string) => (await read<{ events: unknown[] }>(app, `/inbox/${key}`)).events
 export const thread = (app: App, id: string) => read<Thread>(app, `/messages/${id}`)
 
-export async function eventually<T>(check: () => Promise<T | undefined>): Promise<T> {
-  const deadline = Date.now() + 5000
+export async function eventually<T>(check: () => Promise<T | undefined>, timeout = 5000): Promise<T> {
+  const deadline = Date.now() + timeout
   for (;;) {
     const found = await check()
     if (found !== undefined) return found

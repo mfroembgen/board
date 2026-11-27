@@ -17,7 +17,7 @@ export type GitLabSync = {
 type Lifecycle = Extract<ReceivedEvent['event'], { kind: 'lifecycle' }>
 type Kind = 'mr' | 'issue'
 type Change = Omit<Lifecycle, 'kind' | 'channel' | 'thread' | 'author'> & { kind: Kind; iid: number; project: number }
-type Pipeline = { id: number; status: string; sha: string; url: string }
+type Pipeline = { id: number; project: number; status: string; sha: string; url: string }
 type Kept = { pipeline: Pipeline } | null
 
 type User = {
@@ -112,8 +112,7 @@ function rootOf(project: number | string, kind: Kind, item: Noteable): Omit<Sync
     return { text: `MR !${item.iid}: ${item.title}\n${item.web_url}`, labels, author }
   }
   const labels = { issue: item.references?.full ?? '', state: item.state === 'closed' ? 'closed' : 'open' }
-  const title = item.confidential === true ? '(confidential)' : item.title
-  return { text: `Issue #${item.iid}: ${title}\n${item.web_url}`, labels, author }
+  return { text: `Issue #${item.iid}: ${item.title}\n${item.web_url}`, labels, author }
 }
 
 function mergeRequestChanges(hook: Hook, project: number): Change[] {
@@ -194,7 +193,7 @@ function pipelineChanges(hook: Hook, project: number): Change[] {
 
 function pipelineOf(hook: Hook): Pipeline {
   const pipeline = hook.object_attributes ?? {}
-  return { id: pipeline.id ?? 0, status: pipeline.status ?? '', sha: pipeline.sha ?? '', url: pipeline.url ?? `${hook.project?.web_url}/-/pipelines/${pipeline.id}` }
+  return { id: pipeline.id ?? 0, project: hook.project?.id ?? 0, status: pipeline.status ?? '', sha: pipeline.sha ?? '', url: pipeline.url ?? `${hook.project?.web_url}/-/pipelines/${pipeline.id}` }
 }
 
 const HOOKS = new Map<string, (hook: Hook, project: number) => Change[]>([
@@ -323,19 +322,17 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
       return sync.deliver()
     }
     const event = sync.event
-    if (event.kind !== 'message' && event.kind !== 'lifecycle') return void (await sync.import())
     const [project, kind, iid] = native(sync.key, event.thread).split(':') as [string, Kind, string]
-    const path = await pathOf(project)
-    const prefix = excludedBy(path)
+    const source = event.kind === 'lifecycle' ? (event.raw as Kept)?.pipeline.project : undefined
+    const paths = await Promise.all([...new Set([project, ...(source ? [String(source)] : [])])].map(pathOf))
+    const prefix = paths.map(excludedBy).find(Boolean)
     if (prefix) return drops.record('gitlab', 'excluded_path', prefix)
-    const channel = gitlabChannel(path)
-    if (event.kind === 'message') {
-      if (kind === 'issue' && (await noteableOf(project, kind, iid)).confidential === true) return drops.record('gitlab', 'confidential')
-      return void (await sync.import(channel))
-    }
-    const item = await noteableOf(project, kind, iid)
-    if (item.confidential === true) return drops.record('gitlab', 'confidential')
-    const overrides = await reconciled(event, project, kind, item, event.raw as Kept)
+    const item = kind === 'issue' || event.kind === 'lifecycle' ? await noteableOf(project, kind, iid) : null
+    if (item?.confidential === true) return drops.record('gitlab', 'confidential')
+    if (event.kind !== 'message' && event.kind !== 'lifecycle') return void (await sync.import())
+    const channel = gitlabChannel(paths[0]!)
+    if (event.kind === 'message') return void (await sync.import(channel))
+    const overrides = await reconciled(event, project, kind, item!, event.raw as Kept)
     if (overrides) await sync.import(channel, overrides)
   }
 
@@ -347,7 +344,9 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
       intercept: lifecycleEvents,
       fetchRoot: async (thread) => {
         const [project, kind, iid] = thread.split(':') as [string, Kind, string]
-        const root = rootOf(project, kind, await noteableOf(project, kind, iid))
+        const item = await noteableOf(project, kind, iid)
+        if (item.confidential === true) throw new Error(`GitLab issue ${project}#${iid} is confidential now`)
+        const root = rootOf(project, kind, item)
         if (kind === 'issue' || !(await approvedOf(project, iid))) return root
         return { ...root, labels: { ...root.labels, review: 'approved' } }
       },
