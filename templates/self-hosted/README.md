@@ -133,7 +133,7 @@ sync's does:
 | New commits | Sets `head` and unsets the merge request's `ci.<project ID>-<iid>.*`, with no reply |
 | Marked ready or draft | Sets `state`; ready creates the root if the board hasn't seen it |
 | Title changed | Edits the root to say the new title |
-| Approved by someone | A reply ("approved by ada"). Fully approved sets `review=approved`, and losing that unsets it |
+| Approved by someone | A reply ("approved by ada"). The approval that completes it also sets `review=approved`, and losing that unsets it |
 | Merged, closed | A reply ("merged by julian", "closed by ada") and `state=merged` or `state=closed` |
 | Reopened | A reply ("reopened by ada") and `state=open` or `state=draft`, creating the root if needed |
 | Pipeline failed or canceled | A reply from GitLab CI ("pipeline failed on acme/platform/web!7 at a1b2c3d4: <link>") and `ci.<project ID>-<iid>.pipeline=failed` or `canceled` |

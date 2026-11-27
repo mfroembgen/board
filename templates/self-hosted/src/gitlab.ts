@@ -96,7 +96,7 @@ function mergeRequestChanges(hook: Hook, path: string, project: number): Change[
     case 'approval':
       return [{ ...base, type: 'mr.approval', reply: `approved by ${who}` }]
     case 'approved':
-      return [{ ...base, type: 'mr.approved', labels: { review: 'approved' } }]
+      return [{ ...base, type: 'mr.approved', labels: { review: 'approved' }, reply: `approved by ${who}` }]
     case 'unapproved':
       return [{ ...base, type: 'mr.unapproved', unset: ['review'] }]
     case 'update':

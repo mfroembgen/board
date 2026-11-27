@@ -307,9 +307,11 @@ test("a merge request's life is one thread: its state, title, approvals and merg
   await hook(mergeRequest('update', { title: 'Ship the export page today', changes: { title: { previous: 'Ship the export page', current: 'Ship the export page today' } } }))
   await until(app, root.id, ({ message }) => message.text.startsWith('MR !7: Ship the export page today'))
   await hook(mergeRequest('approval', { by: 'ada' }))
+  await hook(mergeRequest('approved', { by: 'bo' }))
+  await until(app, root.id, ({ message }) => message.labels.review === 'approved')
   await hook(mergeRequest('merge', { by: 'julian' }))
   const merged = await until(app, root.id, ({ message }) => message.labels.state === 'merged')
-  assert.deepEqual(merged.replies.map((reply) => reply.text), ['approved by ada', 'merged by julian'])
+  assert.deepEqual(merged.replies.map((reply) => reply.text), ['approved by ada', 'approved by bo', 'merged by julian'])
   assert.ok(merged.replies.every((reply) => reply.labels.status === undefined))
 })
 
