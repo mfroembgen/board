@@ -18,7 +18,7 @@ function mergeRequestItem(iid: number, extra: Record<string, unknown> = {}) {
     state: 'opened',
     draft: false,
     sha: 'a1b2c3d4e5f6a7b8',
-    head_pipeline: { id: 300, status: 'failed' },
+    head_pipeline: { id: 300, status: 'failed', sha: 'a1b2c3d4e5f6a7b8' },
     web_url: `${MR_URL}/${iid}`,
     references: { full: `acme/platform/web!${iid}` },
     author: { id: 6, username: 'bo', name: 'Bo' },
@@ -52,6 +52,7 @@ beforeEach(() => {
     '/projects/50': projectOf(50, 'acme/hiring/pipeline'),
     '/projects/77': projectOf(77, 'acme/forks/web'),
     '/projects/42/merge_requests/7': mergeRequestItem(7),
+    '/projects/42/merge_requests/7/approvals': { approved: false },
     '/projects/42/merge_requests/8': mergeRequestItem(8),
     '/projects/42/issues/3': issueItem(),
   }
@@ -139,14 +140,15 @@ function issue(action: string, by = 'ada') {
   }
 }
 
-function pipeline(id: number, status: string, options: { project?: { id: number; path: string }; target?: number; variables?: object[] } = {}) {
+function pipeline(id: number, status: string, options: { project?: { id: number; path: string }; target?: number; iid?: number; variables?: object[] } = {}) {
   const project = options.project ?? { id: 42, path: 'acme/platform/web' }
+  const iid = options.iid ?? 7
   return {
     object_kind: 'pipeline',
     user: person('bo'),
     project: projectOf(project.id, project.path),
     object_attributes: { id, status, sha: 'a1b2c3d4e5f6a7b8', url: `https://gitlab.test/${project.path}/-/pipelines/${id}`, variables: options.variables ?? [] },
-    merge_request: { iid: 7, url: `${MR_URL}/7`, source_project_id: project.id, target_project_id: options.target ?? project.id },
+    merge_request: { iid, url: `${MR_URL}/${iid}`, state: 'opened', source_project_id: project.id, target_project_id: options.target ?? project.id },
   }
 }
 
@@ -321,11 +323,12 @@ test("a merge request's life is one thread: its state, title, approvals and merg
   await gitlabHook(app, 'Merge Request Hook', mergeRequest('update', { changes: { title: { previous: 'Ship the export page', current: 'Ship the export page today' } } }))
   await until(app, root.id, ({ message }) => message.text.startsWith('MR !7: Ship the export page today'))
   await gitlabHook(app, 'Merge Request Hook', mergeRequest('approval', { by: 'ada' }))
+  setItem(`${mr}/approvals`, { approved: true })
   await gitlabHook(app, 'Merge Request Hook', mergeRequest('approved', { by: 'bo' }))
   await until(app, root.id, ({ message }) => message.labels.review === 'approved')
   setItem(mr, { state: 'merged' })
   await gitlabHook(app, 'Merge Request Hook', mergeRequest('merge', { by: 'julian' }))
-  const merged = await until(app, root.id, ({ message }) => message.labels.state === 'merged')
+  const merged = await until(app, root.id, ({ message, replies }) => message.labels.state === 'merged' && replies.length === 3)
   assert.deepEqual(repliesOf(merged), ['approved by ada', 'approved by bo', 'merged by julian'])
   assert.ok(merged.replies.every((reply) => reply.labels.status === undefined))
 })
@@ -353,6 +356,7 @@ test('a failure of the head pipeline labels and replies; a superseded run, or on
   await gitlabHook(app, 'Merge Request Hook', mergeRequest('open'))
   const root = await mergeRequestRoot(app)
   await gitlabHook(app, 'Pipeline Hook', pipeline(299, 'canceled'))
+  await gitlabHook(app, 'Pipeline Hook', pipeline(300, 'canceled'))
   await gitlabHook(app, 'Pipeline Hook', pipeline(300, 'failed'))
   const failed = await until(app, root.id, ({ message }) => message.labels['ci.42-7.pipeline'] === 'failed')
   assert.deepEqual(repliesOf(failed), [`pipeline failed on acme/platform/web!7 at a1b2c3d4: https://gitlab.test/acme/platform/web/-/pipelines/300`])
@@ -367,16 +371,22 @@ test('a failure of the head pipeline labels and replies; a superseded run, or on
   assert.equal(after.message.labels['ci.42-7.pipeline'], undefined)
 })
 
-test('losing approvals unsets review, whichever event GitLab sends for it', async () => {
+test('losing approvals unsets review, whichever event GitLab sends for it, and a late approval does not bring it back', async () => {
   const app = board({ gitlab: gitlabSync() })
+  const approvals = '/projects/42/merge_requests/7/approvals'
   await gitlabHook(app, 'Merge Request Hook', mergeRequest('open'))
   const root = await mergeRequestRoot(app)
   for (const event of ['unapproval', 'unapproved']) {
+    setItem(approvals, { approved: true })
     await gitlabHook(app, 'Merge Request Hook', mergeRequest('approved', { by: 'ada' }))
     await until(app, root.id, ({ message }) => message.labels.review === 'approved')
+    setItem(approvals, { approved: false })
     await gitlabHook(app, 'Merge Request Hook', mergeRequest(event, { by: 'ada' }))
     await until(app, root.id, ({ message }) => message.labels.review === undefined)
   }
+  await gitlabHook(app, 'Merge Request Hook', mergeRequest('approved', { by: 'bo' }))
+  const late = await until(app, root.id, ({ replies }) => replies.at(-1)?.text === 'approved by bo')
+  assert.equal(late.message.labels.review, undefined)
 })
 
 test("a closed merge request's draft flag changing opens no thread", async () => {
@@ -392,7 +402,7 @@ test("a closed merge request's draft flag changing opens no thread", async () =>
 
 test("a fork's pipeline lands on the target project's merge request", async () => {
   const app = board({ gitlab: gitlabSync() })
-  setItem('/projects/42/merge_requests/7', { head_pipeline: { id: 400, status: 'failed' } })
+  setItem('/projects/42/merge_requests/7', { head_pipeline: { id: 400, status: 'failed', sha: 'a1b2c3d4e5f6a7b8' } })
   await gitlabHook(app, 'Pipeline Hook', pipeline(400, 'failed', { project: { id: 77, path: 'acme/forks/web' }, target: 42 }))
   const root = await mergeRequestRoot(app)
   const failed = await until(app, root.id, ({ message }) => message.labels['ci.42-7.pipeline'] === 'failed')
@@ -405,11 +415,23 @@ test('a new commit on a merge request moves its head and clears its pipeline lab
   const root = await mergeRequestRoot(app)
   await gitlabHook(app, 'Pipeline Hook', pipeline(300, 'failed'))
   await until(app, root.id, ({ message }) => message.labels['ci.42-7.pipeline'] === 'failed')
-  setItem('/projects/42/merge_requests/7', { sha: 'b2c3d4e5f6a7b8c9', head_pipeline: { id: 301, status: 'running' } })
+  setItem('/projects/42/merge_requests/7', { sha: 'b2c3d4e5f6a7b8c9', head_pipeline: { id: 301, status: 'running', sha: 'b2c3d4e5f6a7b8c9' } })
   await gitlabHook(app, 'Merge Request Hook', mergeRequest('update', { oldrev: 'a1b2c3d4e5f6a7b8' }))
   const pushed = await until(app, root.id, ({ message }) => message.labels.head === 'b2c3d4e5f6a7b8c9')
   assert.equal(pushed.message.labels['ci.42-7.pipeline'], undefined)
   assert.equal(pushed.replies.length, 1)
+})
+
+test("a push GitLab sends after the new head's pipeline has failed keeps that failure", async () => {
+  const app = board({ gitlab: gitlabSync() })
+  setItem('/projects/42/merge_requests/7', { sha: 'b2c3d4e5f6a7b8c9', head_pipeline: { id: 301, status: 'failed', sha: 'b2c3d4e5f6a7b8c9' } })
+  await gitlabHook(app, 'Pipeline Hook', pipeline(301, 'failed'))
+  const root = await mergeRequestRoot(app)
+  await until(app, root.id, ({ message }) => message.labels['ci.42-7.pipeline'] === 'failed')
+  await gitlabHook(app, 'Merge Request Hook', mergeRequest('update', { oldrev: 'a1b2c3d4e5f6a7b8' }))
+  await eventually(async () => ((await inbox(app, 'gitlab')).length === 2 ? true : undefined))
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal((await thread(app, root.id)).message.labels['ci.42-7.pipeline'], 'failed')
 })
 
 test("an issue's opening, closing and reopening land in its thread", async () => {
@@ -443,4 +465,30 @@ test('an issue or merge request from before the sync gets its root from GitLab w
   const failed = await until(app, root.id, ({ replies }) => replies.length === 1)
   assert.equal(failed.message.labels['ci.42-7.pipeline'], 'failed')
   assert.equal((await thread(app, root.id)).message.labels.state, 'open')
+
+  setItem('/projects/42/merge_requests/8', { head_pipeline: { id: 310, status: 'success', sha: 'a1b2c3d4e5f6a7b8' } })
+  await gitlabHook(app, 'Pipeline Hook', pipeline(310, 'success', { iid: 8 }))
+  assert.equal((await mergeRequestRoot(app, 8)).labels.state, 'open')
+})
+
+test('a confidential issue stays off the board, even from an event sent before it became confidential', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  setItem('/projects/42/issues/3', { confidential: true, title: 'Layoffs in the platform team' })
+  await gitlabHook(app, 'Issue Hook', issue('close', 'bo'))
+  await gitlabHook(app, 'Note Hook', { ...note(1003, 'd3', 'see the plan'), object_attributes: { ...note(1003, 'd3', 'see the plan').object_attributes, noteable_type: 'Issue' }, merge_request: undefined, issue: { id: 901, iid: 3, title: 'Export page is blank' } })
+  await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
+  await mergeRequestRoot(app)
+  await eventually(async () => (logged.filter((line) => line === '[board] gitlab dropped: confidential').length === 2 ? true : undefined))
+  assert.ok(!JSON.stringify(await channel(app, 'gitlab/platform')).includes('Layoffs'))
+})
+
+test('a merge request whose target moved into an excluded group is dropped at once, however recently its old path was seen', async () => {
+  const app = board({ gitlab: gitlabSync(['acme/hiring']) })
+  const fork = { id: 77, path: 'acme/forks/web' }
+  await gitlabHook(app, 'Pipeline Hook', pipeline(400, 'failed', { project: fork, target: 42 }))
+  await eventually(async () => ((await inbox(app, 'gitlab')).length === 1 ? true : undefined))
+  api['/projects/42'] = { ...(api['/projects/42'] as object), path_with_namespace: 'acme/hiring/web' }
+  await gitlabHook(app, 'Pipeline Hook', pipeline(401, 'failed', { project: fork, target: 42 }))
+  assert.equal((await inbox(app, 'gitlab')).length, 1)
+  assert.ok(logged.includes('[board] gitlab dropped: excluded path acme/hiring'))
 })

@@ -1,4 +1,4 @@
-export type DropReason = 'excluded_path' | 'unreadable_project' | 'excluded_target' | 'unimported_target' | 'unsigned' | 'refused_token' | 'direct_message'
+export type DropReason = 'excluded_path' | 'unreadable_project' | 'excluded_target' | 'unimported_target' | 'unsigned' | 'refused_token' | 'direct_message' | 'unmapped_space' | 'confidential'
 
 export type Drops = {
   record(entry: string, reason: DropReason, detail?: string): void

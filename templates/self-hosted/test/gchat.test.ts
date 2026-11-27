@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { after, mock, test } from 'node:test'
 import { exportJWK, importPKCS8, SignJWT } from 'jose'
 import type { SyncOptions } from '../src/sync.ts'
-import { board, channel, eventually, inbox, URL_, type App } from './sync-board.ts'
+import { asAda, board, channel, eventually, inbox, URL_, type App } from './sync-board.ts'
 
 const PROJECT_NUMBER = '123456789'
 const ADD_ON = `service-${PROJECT_NUMBER}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`
@@ -125,6 +125,16 @@ test('a space the board maps to no channel stays off it and out of the inbox', a
   assert.equal((await hook(app, elsewhere, `Bearer ${await token()}`)).status, 200)
   assert.deepEqual(await inbox(app, 'gchat'), [])
   assert.deepEqual(await channel(app, 'gchat/bbbb'), [])
+  assert.match(await (await app(new Request('https://board.test/metrics'))).text(), /^board_sync_dropped_total\{entry="gchat",reason="unmapped_space"\} 1$/m)
+})
+
+test('a board thread linked to a space the map no longer names sends nothing there', async () => {
+  const app = board({ gchat: gchatSync })
+  const own = ((await (await asAda(app, 'POST', '/messages', { channel: 'support', text: 'a plan' })).json()) as { message: { id: string } }).message
+  const target = `gchat:spaces/BBBB:${Buffer.from('spaces/BBBB/threads/t9').toString('base64url')}`
+  assert.equal((await asAda(app, 'POST', `/messages/${own.id}/sync`, { target })).status, 200)
+  await asAda(app, 'POST', '/messages', { re: own.id, text: 'still there?' })
+  await eventually(async () => (logged.includes('[board] gchat dropped: unmapped space') ? true : undefined))
 })
 
 test('a direct message to the app is answered and never stored, even from a space the board maps', async () => {

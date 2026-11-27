@@ -50,6 +50,7 @@ type Hook = {
   merge_request?: {
     iid?: number
     url?: string
+    state?: string
     source_project_id?: number
     target_project_id?: number
     source?: ProjectRef
@@ -62,13 +63,15 @@ type Noteable = {
   web_url: string
   state: string
   draft?: boolean
+  confidential?: boolean
   sha?: string
   references?: { full?: string }
-  head_pipeline?: { id?: number; status?: string } | null
+  head_pipeline?: { id?: number; status?: string; sha?: string } | null
   author: User
 }
 
 const PIPELINE_FAILED = ['failed', 'canceled']
+const APPROVAL_EVENTS = ['mr.approval', 'mr.approved', 'mr.unapproved']
 const PATH_TTL_MS = 10 * 60 * 1000
 const GITLAB_CI: ExternalAuthor = { id: 'gitlab:user:gitlab-ci', handle: 'gitlab-ci', name: 'GitLab CI', avatar: null, isBot: true }
 
@@ -125,7 +128,7 @@ function mergeRequestChanges(hook: Hook, project: number): Change[] {
       return [{ ...base, type: 'mr.approved', labels: { review: 'approved' }, reply: `approved by ${who}` }]
     case 'unapproval':
     case 'unapproved':
-      return [{ ...base, type: 'mr.unapproved', unset: ['review'], createRoot: false }]
+      return [{ ...base, type: 'mr.unapproved', unset: ['review'], createRoot: mr.state === 'opened' }]
     case 'update':
       return mergeRequestUpdates(hook, base)
     default:
@@ -135,10 +138,11 @@ function mergeRequestChanges(hook: Hook, project: number): Change[] {
 
 function mergeRequestUpdates(hook: Hook, base: Omit<Change, 'type'>): Change[] {
   const changes = hook.changes ?? {}
+  const createRoot = hook.object_attributes?.state === 'opened'
   const updates: Change[] = []
-  if (changes.title) updates.push({ ...base, type: 'mr.edited', retitled: true, createRoot: false })
-  if ('draft' in changes || 'work_in_progress' in changes) updates.push({ ...base, type: 'mr.state', createRoot: hook.object_attributes?.state === 'opened' })
-  if (hook.object_attributes?.oldrev) updates.push({ ...base, type: 'mr.synchronized', owns: [ciPrefix(base.project, base.iid)], createRoot: false })
+  if (changes.title) updates.push({ ...base, type: 'mr.edited', retitled: true, createRoot })
+  if ('draft' in changes || 'work_in_progress' in changes) updates.push({ ...base, type: 'mr.state', createRoot })
+  if (hook.object_attributes?.oldrev) updates.push({ ...base, type: 'mr.synchronized', owns: [ciPrefix(base.project, base.iid)], createRoot })
   return updates
 }
 
@@ -154,7 +158,7 @@ function issueChanges(hook: Hook, project: number): Change[] {
     case 'close':
       return [{ ...base, type: 'issue.closed', reply: `closed by ${who}` }]
     case 'update':
-      return hook.changes?.title ? [{ ...base, type: 'issue.edited', retitled: true, createRoot: false }] : []
+      return hook.changes?.title ? [{ ...base, type: 'issue.edited', retitled: true, createRoot: issue.state === 'opened' }] : []
     default:
       return []
   }
@@ -177,7 +181,7 @@ function pipelineChanges(hook: Hook, project: number): Change[] {
     labels: failed ? { [key]: status } : {},
     unset: failed ? [] : [key],
     reply: failed ? `pipeline ${status}` : null,
-    createRoot: failed,
+    createRoot: hook.merge_request?.state === 'opened',
   }]
 }
 
@@ -267,7 +271,7 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
       if (prefix) return ['excluded_path', prefix]
     }
     for (const id of ids) {
-      const path = await pathOf(id).catch(() => null)
+      const path = await pathOf(id, true).catch(() => null)
       if (path === null) return ['unreadable_project']
       const prefix = excludedBy(path)
       if (prefix) return ['excluded_path', prefix]
@@ -277,17 +281,34 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
   const noteableOf = (project: string, kind: string, iid: string) =>
     adapter.request<Noteable>('GET', `/projects/${project}/${kind === 'mr' ? 'merge_requests' : 'issues'}/${iid}`)
 
-  const reconciled = (event: Lifecycle, kind: Kind, item: Noteable, kept: Kept): SyncOverrides | null => {
+  const approvedOf = async (project: string, iid: string) =>
+    (await adapter.request<{ approved?: boolean }>('GET', `/projects/${project}/merge_requests/${iid}/approvals`)).approved === true
+
+  const headFailure = (project: string, item: Noteable): Record<string, string> => {
+    const head = item.head_pipeline
+    if (!head || head.sha !== item.sha || !PIPELINE_FAILED.includes(head.status ?? '')) return {}
+    return { [pipelineLabel(project, item.iid)]: head.status! }
+  }
+
+  const reconciled = async (event: Lifecycle, project: string, kind: Kind, item: Noteable, kept: Kept): Promise<SyncOverrides | null> => {
     const current = rootOf(kind, item)
     const state = kind === 'mr' ? { state: current.labels.state!, ...(item.sha ? { head: item.sha } : {}) } : { state: current.labels.state! }
     const overrides: SyncOverrides = { labels: { ...event.labels, ...state }, root: () => ({ text: current.text, labels: current.labels }) }
+    if (event.type === 'mr.synchronized') return { ...overrides, labels: { ...overrides.labels, ...headFailure(project, item) } }
+    if (APPROVAL_EVENTS.includes(event.type)) {
+      const { review: _, ...labels } = overrides.labels!
+      return (await approvedOf(project, String(item.iid))) ? { ...overrides, labels: { ...labels, review: 'approved' } } : { ...overrides, labels, unset: ['review'] }
+    }
     if (!event.type.startsWith('ci.')) return overrides
     const head = item.head_pipeline
     const pipeline = kept?.pipeline
-    if (!pipeline || head?.id !== pipeline.id || PIPELINE_FAILED.includes(head.status ?? '') !== PIPELINE_FAILED.includes(pipeline.status)) return null
+    if (!pipeline || head?.id !== pipeline.id || head.status !== pipeline.status) return null
     if (event.type === 'ci.passed') return overrides
     return { ...overrides, text: `pipeline ${pipeline.status} on ${item.references?.full ?? `!${item.iid}`} at ${pipeline.sha.slice(0, 8)}: ${pipeline.url}` }
   }
+
+  const confidential = async (project: string, kind: Kind, iid: string, item?: Noteable) =>
+    kind === 'issue' && (item ?? (await noteableOf(project, kind, iid))).confidential === true
 
   const sync: SyncFn<ChatSdkEvent<'gitlab'>> = async (sync) => {
     if (sync.direction === 'out') {
@@ -303,8 +324,13 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
     if (event.kind !== 'message' && event.kind !== 'lifecycle') return void (await sync.import())
     const [project, kind, iid] = native(sync.key, event.thread).split(':') as [string, Kind, string]
     const channel = gitlabChannel(await pathOf(project))
-    if (event.kind === 'message') return void (await sync.import(channel))
-    const overrides = reconciled(event, kind, await noteableOf(project, kind, iid), event.raw as Kept)
+    if (event.kind === 'message') {
+      if (await confidential(project, kind, iid)) return drops.record('gitlab', 'confidential')
+      return void (await sync.import(channel))
+    }
+    const item = await noteableOf(project, kind, iid)
+    if (await confidential(project, kind, iid, item)) return drops.record('gitlab', 'confidential')
+    const overrides = await reconciled(event, project, kind, item, event.raw as Kept)
     if (overrides) await sync.import(channel, overrides)
   }
 

@@ -130,7 +130,9 @@ thread came from. A board thread someone attaches to a GitLab target by hand
 (`vb sync <id> gitlab:<project>:mr:<iid>`) gets nothing sent there, so no one
 can have the bot post where they couldn't. Before each delivery the board asks
 GitLab for the project's path again, so a project moved into an excluded
-namespace gets no more posts; other lookups keep a path for 10 minutes. GitLab runs a quick action (`/close`, `/approve`)
+namespace gets no more posts. Each inbound event that names another project by
+ID alone, as a fork's pipeline names its target, asks too; only the channel a
+thread lands in keeps a path for 10 minutes. GitLab runs a quick action (`/close`, `/approve`)
 from any comment line that starts with one, as the bot, so the board escapes
 every line whose first character past its spaces is `/` as `\/`: GitLab shows
 it as written and runs nothing. In a code block the backslash shows. A thread's whole life comes along, as the GitHub
@@ -139,10 +141,10 @@ sync's does:
 | GitLab event | What the board does |
 | --- | --- |
 | Merge request opened | A root `MR !<iid>: <title>` with its link, labelled `mr=<project path>!<iid>`, `head=<sha>` and `state=open` or `state=draft` |
-| New commits | Sets `head` and unsets the merge request's `ci.<project ID>-<iid>.*`, with no reply |
+| New commits | Sets `head` and unsets the merge request's `ci.<project ID>-<iid>.*`, with no reply, unless the new head's pipeline has already failed |
 | Marked ready or draft | Sets `state` |
 | Title changed | Edits the root to say the new title |
-| Approved by someone | A reply ("approved by ada"). The approval that completes it also sets `review=approved`, and losing an approval unsets it |
+| Approved by someone | A reply ("approved by ada"). `review=approved` follows GitLab's `approved` for the merge request at that moment, so a late approval event can't bring back one since lost |
 | Merged, closed | A reply ("merged by julian", "closed by ada") and `state=merged` or `state=closed` |
 | Reopened | A reply ("reopened by ada") and `state=open` or `state=draft` |
 | Pipeline failed or canceled | A reply from GitLab CI ("pipeline failed on acme/platform/web!7 at a1b2c3d4: <link>") and `ci.<project ID>-<iid>.pipeline=failed` or `canceled` |
@@ -160,13 +162,15 @@ success, stays off the thread. A fork's pipeline lands on the target project's
 merge request. Only merge request pipelines carry their merge request; a
 branch pipeline reaches no thread. An event or comment on a merge request or
 issue the board hasn't seen creates its root from the API first, with the same
-text and labels; one from an event is shown as by whoever caused it, or GitLab
+text and labels, while it is open; one from an event is shown as by whoever caused it, or GitLab
 CI for a pipeline. The mirror owns `state`, `head`, `review` and `ci.*` on
 those roots. The adapter passes
 only new public comments and their emoji: comment edits and deletes, system
 notes, and internal and confidential notes stay on GitLab. Point the webhook
-at no confidential issue events: an issue made confidential after the board
-mirrored it then stays on the board as it was.
+at no confidential issue events. For each event and comment on an issue the
+board reads the issue first and drops the event while it is confidential, so
+one sent before it became confidential can't bring its new title onto the
+board; what the board mirrored before stays as it was.
 
 **Google Chat.** The adapter reads Google Workspace add-on events, so build the
 Chat app as an add-on with the HTTP endpoint
@@ -177,7 +181,9 @@ URL, as exactly the app's own add-on identity,
 verified email. It refuses Chat's shared identity, other add-ons, tokens for
 the project number and Pub/Sub pushes, and logs only why, never the token.
 Each Chat thread in a space `GOOGLE_CHAT_SPACES` names is a board thread in
-that space's channel, and replies on the board go back to it. Direct messages
+that space's channel, and replies on the board go back to it. Take a space out
+of the map and its threads stop syncing both ways, ones the board already
+mirrored or someone linked by hand included. Direct messages
 to the app are answered and never stored. The board takes only what reaches
 the add-on endpoint: messages that mention the app, and interactions with it.
 It takes no Workspace Events and needs no domain-wide delegation.
