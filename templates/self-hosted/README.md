@@ -117,16 +117,38 @@ and the adapter checks every request before the board stores it.
 | `GOOGLE_CHAT_PUBSUB_TOPIC`, `GOOGLE_CHAT_PUBSUB_SERVICE_ACCOUNT_EMAIL`, `GOOGLE_CHAT_IMPERSONATE_USER` | Optional, all three together: every message in a space through Workspace Events, instead of only messages that mention the app |
 | `BOARD_TRIAGE_CHANNEL` | Optional. Where the triage watcher announces each new thread from GitLab |
 
-**GitLab.** Point a group or project webhook at `/webhooks/gitlab` with
-the secret token, and the **Comments** and **Emoji events** triggers. Each
+**GitLab.** Point a group or project webhook at `/webhooks/gitlab` with the
+secret token and the **Comments**, **Emoji events**, **Merge request events**,
+**Issues events** and **Pipeline events** triggers; push events stay off. Each
 merge request or issue is one board thread in `gitlab/<subgroup>`: the
 namespace under the top group (`acme/platform/web` lands in
-`gitlab/platform`), or `gitlab/<group>` for the group's own projects. Its root
-is the title and link, and every comment and discussion on it is a reply.
-Replies on the board go back as comments by the token's bot. The adapter
-passes only new public comments and their emoji: edits, deletes, system notes,
-internal and confidential notes stay on GitLab, and a merge request or issue
-comes over with its first comment.
+`gitlab/platform`), or `gitlab/<group>` for the group's own projects. Every
+comment and discussion on it is a reply, and replies on the board go back as
+comments by the token's bot. A thread's whole life comes along, as the GitHub
+sync's does:
+
+| GitLab event | What the board does |
+| --- | --- |
+| Merge request opened | A root `MR !<iid>: <title>` with its link, labelled `mr=<project path>!<iid>`, `head=<sha>` and `state=open` or `state=draft` |
+| New commits | Sets `head` and unsets the merge request's `ci.<project ID>-<iid>.*`, with no reply |
+| Marked ready or draft | Sets `state`; ready creates the root if the board hasn't seen it |
+| Title changed | Edits the root to say the new title |
+| Approved by someone | A reply ("approved by ada"). Fully approved sets `review=approved`, and losing that unsets it |
+| Merged, closed | A reply ("merged by julian", "closed by ada") and `state=merged` or `state=closed` |
+| Reopened | A reply ("reopened by ada") and `state=open` or `state=draft`, creating the root if needed |
+| Pipeline failed or canceled | A reply from GitLab CI ("pipeline failed on acme/platform/web!7 at a1b2c3d4: <link>") and `ci.<project ID>-<iid>.pipeline=failed` or `canceled` |
+| Pipeline succeeded | Unsets `ci.<project ID>-<iid>.pipeline`, with no reply |
+| Issue opened | A root `Issue #<iid>: <title>` with its link, labelled `issue=<project path>#<iid>` and `state=open` |
+| Issue closed, reopened | A reply ("closed by ada", "reopened by ada") and `state` |
+
+A pipeline counts only when it is the merge request's head pipeline, which the
+board asks GitLab for, so a run a newer push superseded stays off the thread.
+Only merge request pipelines carry their merge request; a branch pipeline
+reaches no thread. A comment on a merge request or issue the board hasn't seen
+creates its root from the API first, with the same text and labels. The mirror
+owns `state`, `head`, `review` and `ci.*` on those roots. The adapter passes
+only new public comments and their emoji: comment edits and deletes, system
+notes, and internal and confidential notes stay on GitLab.
 
 **Google Chat.** The adapter reads Google Workspace add-on events, so build the
 Chat app as an add-on with the HTTP endpoint
@@ -140,8 +162,8 @@ subscribes each space the app joins to Workspace Events as the impersonated
 user, which needs domain-wide delegation, and Pub/Sub pushes to the same URL
 with tokens for it from that service account.
 
-**Triage.** The `triage` watcher labels every new thread from GitLab
-`status=triage`, and posts a line about it in `BOARD_TRIAGE_CHANNEL` when that
+**Triage.** The `triage` watcher labels every new root from GitLab
+`status=triage`, never a reply or a label change, and posts a line about it in `BOARD_TRIAGE_CHANNEL` when that
 is set. Labels never sync out, and the triage channel starts no platform
 threads, so nothing reaches GitLab. Find the queue with
 `vb read gitlab/ --label status=triage`, and take a thread off it with

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -43,6 +44,9 @@ const gitlabApi: Record<string, unknown> = {
     title: 'Ship the export page',
     description: null,
     state: 'opened',
+    draft: false,
+    sha: 'a1b2c3d4e5f6a7b8',
+    head_pipeline: { id: 300 },
     web_url: 'https://gitlab.test/acme/platform/web/-/merge_requests/7',
     references: { full: 'acme/platform/web!7' },
     author: { id: 6, username: 'bo', name: 'Bo' },
@@ -131,12 +135,65 @@ function note(id: number, discussion: string, text: string, path = 'acme/platfor
   }
 }
 
-const gitlabHook = (app: App, body: unknown, token = SECRET) =>
+const gitlabHook = (app: App, body: unknown, token = SECRET, event = 'Note Hook') =>
   app(new Request(`${URL_}/webhooks/gitlab`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-gitlab-event': 'Note Hook', 'x-gitlab-token': token },
+    headers: { 'content-type': 'application/json', 'x-gitlab-event': event, 'x-gitlab-token': token, 'idempotency-key': randomUUID() },
     body: JSON.stringify(body),
   }))
+
+const project = (path = 'acme/platform/web') => ({ id: 42, name: 'web', path_with_namespace: path, web_url: `https://gitlab.test/${path}` })
+const person = (username: string) => ({ id: username.length, name: username, username, avatar_url: null })
+
+function mergeRequest(action: string, extra: { by?: string; iid?: number; title?: string; draft?: boolean; sha?: string; oldrev?: string; changes?: object; path?: string } = {}) {
+  const iid = extra.iid ?? 7
+  return {
+    object_kind: 'merge_request',
+    user: person(extra.by ?? 'bo'),
+    project: project(extra.path),
+    object_attributes: {
+      iid,
+      title: extra.title ?? 'Ship the export page',
+      url: `https://gitlab.test/acme/platform/web/-/merge_requests/${iid}`,
+      action,
+      draft: extra.draft ?? false,
+      last_commit: { id: extra.sha ?? 'a1b2c3d4e5f6a7b8' },
+      ...(extra.oldrev ? { oldrev: extra.oldrev } : {}),
+    },
+    changes: extra.changes ?? {},
+  }
+}
+
+function issue(action: string, by = 'ada') {
+  return {
+    object_kind: 'issue',
+    user: person(by),
+    project: project(),
+    object_attributes: { iid: 3, title: 'Export page is blank', url: 'https://gitlab.test/acme/platform/web/-/issues/3', action },
+    changes: {},
+  }
+}
+
+function pipeline(id: number, status: string, path?: string) {
+  return {
+    object_kind: 'pipeline',
+    user: person('bo'),
+    project: project(path),
+    object_attributes: { id, status, sha: 'a1b2c3d4e5f6a7b8', url: `https://gitlab.test/acme/platform/web/-/pipelines/${id}` },
+    merge_request: { iid: 7, url: 'https://gitlab.test/acme/platform/web/-/merge_requests/7' },
+  }
+}
+
+const hookOf = (app: App, event: string) => (body: unknown) => gitlabHook(app, body, SECRET, event)
+const mirrored = ({ status: _triage, ...labels }: Record<string, string>) => labels
+const thread = (app: App, id: string) => read<{ message: Message; replies: Message[] }>(app, `/messages/${id}`)
+const mergeRequestRoot = (app: App, iid = 7) =>
+  eventually(async () => (await channel(app, 'gitlab/platform')).find((message) => message.re === null && message.labels.mr === `acme/platform/web!${iid}`))
+const until = (app: App, id: string, done: (found: { message: Message; replies: Message[] }) => boolean) =>
+  eventually(async () => {
+    const found = await thread(app, id)
+    return done(found) ? found : undefined
+  })
 
 const googleToken = (claims: Record<string, unknown>) =>
   new SignJWT({ email: ADD_ON, email_verified: true, ...claims })
@@ -195,8 +252,8 @@ test('a GitLab comment with the webhook secret lands in its subgroup channel, on
   assert.equal((await gitlabHook(app, note(1002, 'd2', 'one more thing'))).status, 200)
 
   const root = await eventually(async () => (await channel(app, 'gitlab/platform')).find((message) => message.re === null))
-  assert.match(root.text, /Ship the export page/)
-  assert.equal(root.labels.ref, 'acme/platform/web!7')
+  assert.equal(root.text, 'MR !7: Ship the export page\nhttps://gitlab.test/acme/platform/web/-/merge_requests/7')
+  assert.deepEqual(mirrored(root.labels), { mr: 'acme/platform/web!7', state: 'open', head: 'a1b2c3d4e5f6a7b8' })
   const thread = await eventually(async () => {
     const found = await read<{ replies: Message[] }>(app, `/messages/${root.id}`)
     return found.replies.length === 2 ? found : undefined
@@ -215,6 +272,8 @@ test('an excluded GitLab namespace is answered and never stored', async () => {
   assert.equal((await gitlabHook(app, note(2001, 'd9', 'candidate notes', 'acme/hiring/pipeline'))).status, 200)
   assert.equal((await gitlabHook(app, note(2002, 'd9', 'candidate notes', 'acme/hiring/pipeline'), 'wrong')).status, 401)
   assert.equal((await gitlabHook(app, note(1001, 'd1', 'looks good'))).status, 200)
+  assert.equal((await gitlabHook(app, mergeRequest('open', { path: 'acme/hiring/pipeline' }), SECRET, 'Merge Request Hook')).status, 200)
+  assert.equal((await gitlabHook(app, pipeline(301, 'failed', 'acme/hiring/pipeline'), SECRET, 'Pipeline Hook')).status, 200)
   await eventually(async () => ((await channel(app, 'gitlab/platform')).length ? true : undefined))
   assert.equal((await inbox(app, 'gitlab')).length, 1)
 })
@@ -231,8 +290,78 @@ test('a new thread from GitLab is labelled for triage and announced', async () =
   const root = await eventually(async () => (await channel(app, 'gitlab/platform')).find((message) => message.re === null && message.labels.status))
   assert.equal(root.labels.status, 'triage')
   const announced = await eventually(async () => (await channel(app, 'triage'))[0])
-  assert.equal(announced.text, `gitlab/platform #${root.id}: **Ship the export page**`)
+  assert.equal(announced.text, `gitlab/platform #${root.id}: MR !7: Ship the export page`)
   assert.equal((await channel(app, 'gitlab/notes')).find((message) => message.id === own.message.id)?.labels.status, undefined)
+})
+
+test("a merge request's life is one thread: its state, title, approvals and merge", async () => {
+  const app = board({ gitlab: gitlabSync() })
+  const hook = hookOf(app, 'Merge Request Hook')
+  await hook(mergeRequest('open', { draft: true }))
+  const root = await mergeRequestRoot(app)
+  assert.equal(root.text, 'MR !7: Ship the export page\nhttps://gitlab.test/acme/platform/web/-/merge_requests/7')
+  assert.deepEqual(mirrored(root.labels), { mr: 'acme/platform/web!7', head: 'a1b2c3d4e5f6a7b8', state: 'draft' })
+
+  await hook(mergeRequest('update', { changes: { draft: { previous: true, current: false } } }))
+  await until(app, root.id, ({ message }) => message.labels.state === 'open')
+  await hook(mergeRequest('update', { title: 'Ship the export page today', changes: { title: { previous: 'Ship the export page', current: 'Ship the export page today' } } }))
+  await until(app, root.id, ({ message }) => message.text.startsWith('MR !7: Ship the export page today'))
+  await hook(mergeRequest('approval', { by: 'ada' }))
+  await hook(mergeRequest('merge', { by: 'julian' }))
+  const merged = await until(app, root.id, ({ message }) => message.labels.state === 'merged')
+  assert.deepEqual(merged.replies.map((reply) => reply.text), ['approved by ada', 'merged by julian'])
+  assert.ok(merged.replies.every((reply) => reply.labels.status === undefined))
+})
+
+test('a merge request closed and reopened says so and keeps its state', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  const hook = hookOf(app, 'Merge Request Hook')
+  await hook(mergeRequest('open', { iid: 8 }))
+  const root = await mergeRequestRoot(app, 8)
+  await hook(mergeRequest('close', { iid: 8, by: 'ada' }))
+  await until(app, root.id, ({ message }) => message.labels.state === 'closed')
+  await hook(mergeRequest('reopen', { iid: 8, by: 'ada', draft: true }))
+  const reopened = await until(app, root.id, ({ message }) => message.labels.state === 'draft')
+  assert.deepEqual(reopened.replies.map((reply) => reply.text), ['closed by ada', 'reopened by ada'])
+})
+
+test('a failed pipeline on the merge request labels and replies, and one that is no longer its latest stays off', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  await hookOf(app, 'Merge Request Hook')(mergeRequest('open'))
+  const root = await mergeRequestRoot(app)
+  await hookOf(app, 'Pipeline Hook')(pipeline(299, 'canceled'))
+  await hookOf(app, 'Pipeline Hook')(pipeline(300, 'failed'))
+  const failed = await until(app, root.id, ({ message }) => message.labels['ci.42-7.pipeline'] === 'failed')
+  assert.deepEqual(failed.replies.map((reply) => reply.text), [
+    'pipeline failed on acme/platform/web!7 at a1b2c3d4: https://gitlab.test/acme/platform/web/-/pipelines/300',
+  ])
+})
+
+test('a new commit on a merge request moves its head and clears its pipeline labels', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  const hook = hookOf(app, 'Merge Request Hook')
+  await hook(mergeRequest('open'))
+  const root = await mergeRequestRoot(app)
+  await hookOf(app, 'Pipeline Hook')(pipeline(300, 'failed'))
+  await until(app, root.id, ({ message }) => message.labels['ci.42-7.pipeline'] === 'failed')
+  await hook(mergeRequest('update', { sha: 'b2c3d4e5f6a7b8c9', oldrev: 'a1b2c3d4e5f6a7b8' }))
+  const pushed = await until(app, root.id, ({ message }) => message.labels.head === 'b2c3d4e5f6a7b8c9')
+  assert.equal(pushed.message.labels['ci.42-7.pipeline'], undefined)
+  assert.equal(pushed.replies.length, 1)
+})
+
+test("an issue's opening, closing and reopening land in its thread", async () => {
+  const app = board({ gitlab: gitlabSync() })
+  const hook = hookOf(app, 'Issue Hook')
+  await hook(issue('open'))
+  const root = await eventually(async () => (await channel(app, 'gitlab/platform')).find((message) => message.labels.issue === 'acme/platform/web#3'))
+  assert.equal(root.text, 'Issue #3: Export page is blank\nhttps://gitlab.test/acme/platform/web/-/issues/3')
+  assert.equal(root.labels.state, 'open')
+  await hook(issue('close', 'bo'))
+  await until(app, root.id, ({ message }) => message.labels.state === 'closed')
+  await hook(issue('reopen', 'bo'))
+  const reopened = await until(app, root.id, ({ message, replies }) => message.labels.state === 'open' && replies.length === 2)
+  assert.deepEqual(reopened.replies.map((reply) => reply.text), ['closed by bo', 'reopened by bo'])
 })
 
 test('a Google Chat message signed for the board by the Chat app lands in its space channel', async () => {
