@@ -1,8 +1,7 @@
 import { createGoogleChatAdapter } from '@chat-adapter/gchat'
-import type { Receive, SyncFn, SyncProvider } from '@vercel/board/sync'
-import { chatSdk, type ChatSdkEvent } from '@vercel/board/sync-chat-sdk'
+import type { Receive, SyncProvider } from '@vercel/board/sync'
+import { channels, chatSdk } from '@vercel/board/sync-chat-sdk'
 import { createRemoteJWKSet, jwtVerify } from 'jose'
-import { segment } from './channels.ts'
 
 export type GoogleChatSync = {
   credentials: { client_email: string; private_key: string }
@@ -64,16 +63,7 @@ export function gchat(options: GoogleChatSync, endpointUrl: string): SyncProvide
     disableSignatureVerification: false,
     ...(options.botUserId ? { botUserId: options.botUserId } : {}),
   })
-  const channelsBySpace = options.channelsBySpace ?? {}
-
-  const sync: SyncFn<ChatSdkEvent<'gchat'>> = async (sync) => {
-    if (sync.direction === 'out') return sync.target === null ? undefined : sync.deliver()
-    if (sync.event.thread.endsWith(':dm')) return
-    const space = sync.event.channel.slice(sync.key.length + 1)
-    await sync.import(channelsBySpace[space] ?? `gchat/${segment(space.replace(/^spaces\//, ''))}`)
-  }
-
-  const provider = chatSdk({ adapter, platform: 'gchat' }, sync)
+  const provider = chatSdk({ adapter, platform: 'gchat' }, channels(options.channelsBySpace ?? {}))
   const receive = provider.receive.bind(provider)
   provider.receive = async (key, request, emit) => {
     const event = parsed(await request.clone().text())

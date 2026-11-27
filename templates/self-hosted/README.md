@@ -111,11 +111,11 @@ never reach the inbox.
 | `GITLAB_WEBHOOK_SECRET` | The secret token of the GitLab webhook. GitLab sends it in `X-Gitlab-Token` |
 | `GITLAB_API_URL` | Required with them: `https://gitlab.example.com/api/v4` |
 | `GITLAB_BOT_USER_ID` | Optional. The token's bot user ID. The board asks `GET /user` without it |
-| `GITLAB_EXCLUDE` | Optional. Comma-separated namespace paths, such as `acme/hiring`. An event that names a project in one, as its project, a merge request's source or target, or a pipeline's merge request, is answered and never stored, and the board never posts to their merge requests or issues |
+| `GITLAB_EXCLUDE` | Optional. Comma-separated namespace paths, such as `acme/hiring`, compared case-insensitively. An event that names a project in one, as its project, a merge request's source or target, or a pipeline's merge request, is answered and never stored, and the board never posts to their merge requests or issues |
 | `GOOGLE_CHAT_CREDENTIALS` | The Chat app's service account key, as JSON |
 | `GOOGLE_CHAT_PROJECT_NUMBER` | Required with it: the number of the Chat app's Google Cloud project |
 | `GOOGLE_CHAT_BOT_USER_ID` | Optional. The app's own `users/<id>` name. Without it, every bot's message counts as its own and is skipped |
-| `GOOGLE_CHAT_SPACES` | Optional. `spaces/<id>=<channel>` pairs, comma-separated. Other spaces land in `gchat/<space id>` |
+| `GOOGLE_CHAT_SPACES` | `spaces/<id>=<channel>` pairs, comma-separated: the spaces the board syncs, and their channels. A space it doesn't name stays off the board and out of the inbox |
 | `BOARD_TRIAGE_CHANNEL` | Optional. Where the triage watcher announces each new thread from GitLab |
 
 **GitLab.** Point a group or project webhook at `/webhooks/gitlab` with the
@@ -134,7 +134,7 @@ sync's does:
 | New commits | Sets `head` and unsets the merge request's `ci.<project ID>-<iid>.*`, with no reply |
 | Marked ready or draft | Sets `state` |
 | Title changed | Edits the root to say the new title |
-| Approved by someone | A reply ("approved by ada"). The approval that completes it also sets `review=approved`, and losing that unsets it |
+| Approved by someone | A reply ("approved by ada"). The approval that completes it also sets `review=approved`, and losing an approval unsets it |
 | Merged, closed | A reply ("merged by julian", "closed by ada") and `state=merged` or `state=closed` |
 | Reopened | A reply ("reopened by ada") and `state=open` or `state=draft` |
 | Pipeline failed or canceled | A reply from GitLab CI ("pipeline failed on acme/platform/web!7 at a1b2c3d4: <link>") and `ci.<project ID>-<iid>.pipeline=failed` or `canceled` |
@@ -156,20 +156,23 @@ text and labels; one from an event is shown as by whoever caused it, or GitLab
 CI for a pipeline. The mirror owns `state`, `head`, `review` and `ci.*` on
 those roots. The adapter passes
 only new public comments and their emoji: comment edits and deletes, system
-notes, and internal and confidential notes stay on GitLab.
+notes, and internal and confidential notes stay on GitLab. Point the webhook
+at no confidential issue events: an issue made confidential after the board
+mirrored it then stays on the board as it was.
 
 **Google Chat.** The adapter reads Google Workspace add-on events, so build the
 Chat app as an add-on with the HTTP endpoint
-`https://<host>/api/board/webhooks/gchat`. The board accepts only tokens Google
-signed for that URL as the app's own add-on identity,
-`service-<project number>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`: not
-Chat's shared identity, and not a token for the project number. A refused
-request logs only why, never the token. Each Chat thread is a board thread in
-its space's channel, and replies on the board go back to it. Direct messages
-to the app are answered and never stored. Chat sends the app only messages
-that mention it; every message in a space would need Workspace Events through
-Pub/Sub, whose subscriptions lapse unless renewed, and this board refuses
-Pub/Sub pushes until it renews them.
+`https://<host>/api/board/webhooks/gchat`. Before the adapter reads a request,
+the board checks its token itself: Google must have signed it for exactly that
+URL, as exactly the app's own add-on identity,
+`service-<project number>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`, with a
+verified email. It refuses Chat's shared identity, other add-ons, tokens for
+the project number and Pub/Sub pushes, and logs only why, never the token.
+Each Chat thread in a space `GOOGLE_CHAT_SPACES` names is a board thread in
+that space's channel, and replies on the board go back to it. Direct messages
+to the app are answered and never stored. The board takes only what reaches
+the add-on endpoint: messages that mention the app, and interactions with it.
+It takes no Workspace Events and needs no domain-wide delegation.
 
 **Triage.** The `triage` watcher labels every new root from GitLab
 `status=triage`, never a reply or a label change, and posts a line about it in `BOARD_TRIAGE_CHANNEL` when that
@@ -180,7 +183,9 @@ threads, so nothing reaches GitLab. Find the queue with
 
 In the chart, `sync.gitlab.secretName` and `sync.gchat.secretName` name the
 Secrets whose keys become those variables, and each is optional, so the board
-starts before they exist. `webhookIngress` adds a second Ingress that matches
+starts before they exist. If an ExternalSecret in an earlier Argo CD sync wave
+makes one, the Deployment waits for it, so create its source parameters before
+you deploy. `webhookIngress` adds a second Ingress that matches
 only `/api/board/webhooks/<entry>` exactly, for a controller that faces the
 platform when the rest of the board stays private.
 

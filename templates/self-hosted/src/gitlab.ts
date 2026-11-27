@@ -23,6 +23,7 @@ type User = {
   username?: string
   name?: string
   avatar_url?: string | null
+  bot?: boolean
 }
 type ProjectRef = { path_with_namespace?: string }
 type Hook = {
@@ -34,6 +35,7 @@ type Hook = {
     title?: string
     url?: string
     action?: string
+    state?: string
     oldrev?: string
     status?: string
     sha?: string
@@ -61,7 +63,7 @@ type Noteable = {
   sha?: string
   references?: { full?: string }
   head_pipeline?: { id?: number; status?: string } | null
-  author: User & { bot?: boolean }
+  author: User
 }
 
 const PIPELINE_FAILED = ['failed', 'canceled']
@@ -78,9 +80,12 @@ const ciPrefix = (project: number, iid: number) => `ci.${project}-${iid}.`
 const native = (key: string, id: string) => id.slice(key.length + 1)
 const noteableThread = (thread: string) => thread.split(':').slice(0, 3).join(':')
 
+const BOT_USERNAME = /^(project|group)_\d+_bot(_|$)/
+
 function authorOf(user: User | undefined): ExternalAuthor {
   const handle = user?.username ?? 'someone'
-  return { id: `gitlab:user:${user?.id ?? handle}`, handle, name: user?.name || handle, avatar: user?.avatar_url ?? null, isBot: false }
+  const isBot = user?.bot === true || BOT_USERNAME.test(handle)
+  return { id: `gitlab:user:${user?.id ?? handle}`, handle, name: user?.name || handle, avatar: user?.avatar_url ?? null, isBot }
 }
 
 function mergeRequestState(item: Noteable): string {
@@ -89,7 +94,7 @@ function mergeRequestState(item: Noteable): string {
 }
 
 function rootOf(kind: Kind, item: Noteable): Omit<SyncRoot, 'raw'> {
-  const author = { ...authorOf(item.author), isBot: item.author.bot === true }
+  const author = authorOf(item.author)
   if (kind === 'mr') {
     const labels = { mr: item.references?.full ?? '', state: mergeRequestState(item), ...(item.sha ? { head: item.sha } : {}) }
     return { text: `MR !${item.iid}: ${item.title}\n${item.web_url}`, labels, author }
@@ -115,6 +120,7 @@ function mergeRequestChanges(hook: Hook, project: number): Change[] {
       return [{ ...base, type: 'mr.approval', reply: `approved by ${who}` }]
     case 'approved':
       return [{ ...base, type: 'mr.approved', labels: { review: 'approved' }, reply: `approved by ${who}` }]
+    case 'unapproval':
     case 'unapproved':
       return [{ ...base, type: 'mr.unapproved', unset: ['review'], createRoot: false }]
     case 'update':
@@ -128,7 +134,7 @@ function mergeRequestUpdates(hook: Hook, base: Omit<Change, 'type'>): Change[] {
   const changes = hook.changes ?? {}
   const updates: Change[] = []
   if (changes.title) updates.push({ ...base, type: 'mr.edited', retitled: true, createRoot: false })
-  if ('draft' in changes || 'work_in_progress' in changes) updates.push({ ...base, type: 'mr.state' })
+  if ('draft' in changes || 'work_in_progress' in changes) updates.push({ ...base, type: 'mr.state', createRoot: hook.object_attributes?.state === 'opened' })
   if (hook.object_attributes?.oldrev) updates.push({ ...base, type: 'mr.synchronized', owns: [ciPrefix(base.project, base.iid)], createRoot: false })
   return updates
 }
@@ -177,11 +183,11 @@ function pipelineOf(hook: Hook): Pipeline {
   return { id: pipeline.id ?? 0, status: pipeline.status ?? '', sha: pipeline.sha ?? '', url: pipeline.url ?? `${hook.project?.web_url}/-/pipelines/${pipeline.id}` }
 }
 
-const HOOKS: Partial<Record<string, (hook: Hook, project: number) => Change[]>> = {
-  'Merge Request Hook': mergeRequestChanges,
-  'Issue Hook': issueChanges,
-  'Pipeline Hook': pipelineChanges,
-}
+const HOOKS = new Map<string, (hook: Hook, project: number) => Change[]>([
+  ['Merge Request Hook', mergeRequestChanges],
+  ['Issue Hook', issueChanges],
+  ['Pipeline Hook', pipelineChanges],
+])
 
 function parsed(body: string): Hook | null {
   try {
@@ -194,7 +200,7 @@ function parsed(body: string): Hook | null {
 
 export function lifecycleEvents(key: string, headers: Headers, body: string): ReceivedEvent[] {
   const event = headers.get('x-gitlab-event') ?? ''
-  const changesOf = HOOKS[event]
+  const changesOf = HOOKS.get(event)
   const hook = changesOf ? parsed(body) : null
   const project = hook?.project?.id
   if (!changesOf || !hook?.object_attributes || typeof project !== 'number') return []
@@ -233,8 +239,11 @@ export function gitlab(options: GitLabSync): SyncProvider {
     apiUrl: options.apiUrl,
     ...(options.botUserId ? { botUserId: options.botUserId } : {}),
   })
-  const excludedPaths = options.excludedPaths ?? []
-  const isExcluded = (path: string) => excludedPaths.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))
+  const excludedPaths = (options.excludedPaths ?? []).map((path) => path.toLowerCase())
+  const isExcluded = (path: string) => {
+    const lower = path.toLowerCase()
+    return excludedPaths.some((prefix) => lower === prefix || lower.startsWith(`${prefix}/`))
+  }
   const paths = new Map<string, Promise<string>>()
   const pathOf = (project: number | string) => {
     let path = paths.get(String(project))

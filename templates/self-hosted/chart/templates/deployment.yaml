@@ -79,7 +79,7 @@ spec:
             {{- end }}
             {{- with .Values.sync.gchat.projectNumber }}
             - name: GOOGLE_CHAT_PROJECT_NUMBER
-              value: {{ . | quote }}
+              value: {{ int64 . | toString | quote }}
             {{- end }}
             {{- with .Values.sync.gchat.botUserId }}
             - name: GOOGLE_CHAT_BOT_USER_ID

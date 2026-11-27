@@ -36,6 +36,18 @@ function spaceMap(value: string | undefined): Record<string, string> {
   )
 }
 
+function serviceAccountKey(value: string): GoogleChatSync['credentials'] {
+  let key: unknown
+  try {
+    key = JSON.parse(value)
+  } catch {
+    key = null
+  }
+  const { client_email, private_key } = (key ?? {}) as Record<string, unknown>
+  if (typeof client_email !== 'string' || typeof private_key !== 'string') throw new Error('GOOGLE_CHAT_CREDENTIALS must be a service account key in JSON, with client_email and private_key')
+  return { client_email, private_key }
+}
+
 export function syncFromEnv(env: Env): SyncOptions {
   const options: SyncOptions = {}
   const gitlab = settings(env, 'GitLab', ['GITLAB_TOKEN', 'GITLAB_WEBHOOK_SECRET'], ['GITLAB_TOKEN', 'GITLAB_WEBHOOK_SECRET', 'GITLAB_API_URL'])
@@ -51,7 +63,7 @@ export function syncFromEnv(env: Env): SyncOptions {
   const gchat = settings(env, 'Google Chat', ['GOOGLE_CHAT_CREDENTIALS'], ['GOOGLE_CHAT_CREDENTIALS', 'GOOGLE_CHAT_PROJECT_NUMBER'])
   if (gchat) {
     options.gchat = {
-      credentials: JSON.parse(gchat.GOOGLE_CHAT_CREDENTIALS!),
+      credentials: serviceAccountKey(gchat.GOOGLE_CHAT_CREDENTIALS!),
       projectNumber: gchat.GOOGLE_CHAT_PROJECT_NUMBER!,
       ...(env.GOOGLE_CHAT_BOT_USER_ID ? { botUserId: env.GOOGLE_CHAT_BOT_USER_ID } : {}),
       channelsBySpace: spaceMap(env.GOOGLE_CHAT_SPACES),

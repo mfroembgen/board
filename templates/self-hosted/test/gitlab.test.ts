@@ -98,7 +98,7 @@ function note(id: number, discussion: string, text: string, options: { path?: st
   }
 }
 
-function mergeRequest(action: string, extra: { by?: string; iid?: number; oldrev?: string; changes?: object; path?: string; source?: string } = {}) {
+function mergeRequest(action: string, extra: { by?: string; iid?: number; oldrev?: string; changes?: object; path?: string; source?: string; state?: string } = {}) {
   const iid = extra.iid ?? 7
   const path = extra.path ?? 'acme/platform/web'
   return {
@@ -110,6 +110,7 @@ function mergeRequest(action: string, extra: { by?: string; iid?: number; oldrev
       title: 'Ship the export page',
       url: `${MR_URL}/${iid}`,
       action,
+      state: extra.state ?? 'opened',
       last_commit: { id: 'a1b2c3d4e5f6a7b8' },
       source: { path_with_namespace: extra.source ?? path },
       target: { path_with_namespace: path },
@@ -159,6 +160,20 @@ test('each sync entry is on only when its variables are given', async () => {
   assert.throws(() => syncFromEnv({ GITLAB_TOKEN: 't' }), /GitLab sync needs GITLAB_WEBHOOK_SECRET, GITLAB_API_URL/)
 })
 
+test('a malformed Google Chat key fails the start, naming the variable and not repeating it', () => {
+  for (const value of ['{"private_key": "-----BEGIN sekrit', '{"client_email": "sekrit@example.com"}']) {
+    assert.throws(
+      () => syncFromEnv({ GOOGLE_CHAT_CREDENTIALS: value, GOOGLE_CHAT_PROJECT_NUMBER: '1' }),
+      (error: Error) => /GOOGLE_CHAT_CREDENTIALS/.test(error.message) && !error.message.includes('sekrit'),
+    )
+  }
+})
+
+test('a GitLab event named like an object property is answered like any other unknown event', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  for (const event of ['constructor', 'toString', '__proto__']) assert.equal((await gitlabHook(app, event, mergeRequest('open'))).status, 200)
+})
+
 test('a GitLab comment with the webhook secret lands in its subgroup channel, one thread per merge request', async () => {
   const app = board({ gitlab: gitlabSync() })
   assert.equal((await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))).status, 200)
@@ -202,6 +217,15 @@ test('an excluded namespace is answered and never stored, wherever the payload n
   assert.deepEqual(sent.map((response) => response.status), [200, 200, 200, 200, 200, 200])
   assert.equal((await gitlabHook(app, 'Note Hook', note(2002, 'd9', 'candidate notes', { path: hiring.path, projectId: 50 }), 'wrong')).status, 401)
   assert.equal((await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))).status, 200)
+  await mergeRequestRoot(app)
+  assert.equal((await inbox(app, 'gitlab')).length, 1)
+})
+
+test('exclusions match namespaces whatever their case', async () => {
+  const app = board({ gitlab: gitlabSync(['acme/Hiring']) })
+  await gitlabHook(app, 'Merge Request Hook', mergeRequest('open', { path: 'acme/hiring/pipeline' }))
+  await gitlabHook(app, 'Merge Request Hook', mergeRequest('open', { path: 'acme/HIRING/pipeline' }))
+  await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
   await mergeRequestRoot(app)
   assert.equal((await inbox(app, 'gitlab')).length, 1)
 })
@@ -292,6 +316,29 @@ test('a failure of the head pipeline labels and replies; a superseded run, or on
   const after = await until(app, root.id, ({ replies }) => replies.length === 2)
   assert.deepEqual(repliesOf(after).slice(1), ['approved by ada'])
   assert.equal(after.message.labels['ci.42-7.pipeline'], undefined)
+})
+
+test('losing approvals unsets review, whichever event GitLab sends for it', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  await gitlabHook(app, 'Merge Request Hook', mergeRequest('open'))
+  const root = await mergeRequestRoot(app)
+  for (const event of ['unapproval', 'unapproved']) {
+    await gitlabHook(app, 'Merge Request Hook', mergeRequest('approved', { by: 'ada' }))
+    await until(app, root.id, ({ message }) => message.labels.review === 'approved')
+    await gitlabHook(app, 'Merge Request Hook', mergeRequest(event, { by: 'ada' }))
+    await until(app, root.id, ({ message }) => message.labels.review === undefined)
+  }
+})
+
+test("a closed merge request's draft flag changing opens no thread", async () => {
+  const app = board({ gitlab: gitlabSync() })
+  setItem('/projects/42/merge_requests/8', { state: 'closed' })
+  await gitlabHook(app, 'Merge Request Hook', mergeRequest('update', { iid: 8, state: 'closed', changes: { draft: { previous: true, current: false } } }))
+  await gitlabHook(app, 'Merge Request Hook', mergeRequest('open'))
+  await mergeRequestRoot(app)
+  await eventually(async () => ((await inbox(app, 'gitlab')).length === 2 ? true : undefined))
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal((await channel(app, 'gitlab/platform')).filter((message) => message.re === null).length, 1)
 })
 
 test("a fork's pipeline lands on the target project's merge request", async () => {

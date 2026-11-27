@@ -119,8 +119,16 @@ test('a refused token never reaches the logs', async () => {
   for (const credential of presented) assert.ok(!logged.some((line) => line.includes(credential)), `logs hold ${credential.slice(0, 12)}…`)
 })
 
-test('a direct message to the app is answered and never stored', async () => {
+test('a space the board maps to no channel stays off it and out of the inbox', async () => {
   const app = board({ gchat: gchatSync })
+  const elsewhere = chatEvent({ space: { name: 'spaces/BBBB', type: 'ROOM', displayName: 'Elsewhere' } })
+  assert.equal((await hook(app, elsewhere, `Bearer ${await token()}`)).status, 200)
+  assert.deepEqual(await inbox(app, 'gchat'), [])
+  assert.deepEqual(await channel(app, 'gchat/bbbb'), [])
+})
+
+test('a direct message to the app is answered and never stored, even from a space the board maps', async () => {
+  const app = board({ gchat: { ...gchatSync!, channelsBySpace: { 'spaces/DDDD': 'support' } } })
   const dm = chatEvent({ space: { name: 'spaces/DDDD', type: 'DM', spaceType: 'DIRECT_MESSAGE' } })
   assert.equal((await hook(app, dm, `Bearer ${await token()}`)).status, 200)
   assert.deepEqual(await inbox(app, 'gchat'), [])
