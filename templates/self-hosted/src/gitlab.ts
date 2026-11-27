@@ -47,6 +47,7 @@ type Hook = {
     target_project_id?: number
   }
   changes?: Record<string, unknown>
+  issue?: { iid?: number }
   merge_request?: {
     iid?: number
     url?: string
@@ -99,10 +100,16 @@ function mergeRequestState(item: Noteable): string {
   return item.draft ? 'draft' : 'open'
 }
 
-function rootOf(kind: Kind, item: Noteable): Omit<SyncRoot, 'raw'> {
+function headFailure(project: number | string, item: Noteable): Record<string, string> {
+  const head = item.head_pipeline
+  if (!head || head.sha !== item.sha || !PIPELINE_FAILED.includes(head.status ?? '')) return {}
+  return { [pipelineLabel(project, item.iid)]: head.status! }
+}
+
+function rootOf(project: number | string, kind: Kind, item: Noteable): Omit<SyncRoot, 'raw'> {
   const author = authorOf(item.author)
   if (kind === 'mr') {
-    const labels = { mr: item.references?.full ?? '', state: mergeRequestState(item), ...(item.sha ? { head: item.sha } : {}) }
+    const labels = { mr: item.references?.full ?? '', state: mergeRequestState(item), ...(item.sha ? { head: item.sha } : {}), ...headFailure(project, item) }
     return { text: `MR !${item.iid}: ${item.title}\n${item.web_url}`, labels, author }
   }
   const labels = { issue: item.references?.full ?? '', state: item.state === 'closed' ? 'closed' : 'open' }
@@ -226,7 +233,7 @@ function namedProjects(hook: Hook): { paths: string[]; ids: number[] } {
   const ids = [hook.object_attributes?.source_project_id, hook.object_attributes?.target_project_id, hook.merge_request?.source_project_id, hook.merge_request?.target_project_id]
   return {
     paths: refs.flatMap((ref) => (typeof ref?.path_with_namespace === 'string' ? [ref.path_with_namespace] : [])),
-    ids: ids.filter((id): id is number => typeof id === 'number' && id !== hook.project?.id),
+    ids: [...new Set([hook.project?.id, ...ids].filter((id): id is number => typeof id === 'number'))],
   }
 }
 
@@ -284,14 +291,8 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
   const approvedOf = async (project: string, iid: string) =>
     (await adapter.request<{ approved?: boolean }>('GET', `/projects/${project}/merge_requests/${iid}/approvals`)).approved === true
 
-  const headFailure = (project: string, item: Noteable): Record<string, string> => {
-    const head = item.head_pipeline
-    if (!head || head.sha !== item.sha || !PIPELINE_FAILED.includes(head.status ?? '')) return {}
-    return { [pipelineLabel(project, item.iid)]: head.status! }
-  }
-
   const reconciled = async (event: Lifecycle, project: string, kind: Kind, item: Noteable, kept: Kept): Promise<SyncOverrides | null> => {
-    const current = rootOf(kind, item)
+    const current = rootOf(project, kind, item)
     const state = kind === 'mr' ? { state: current.labels.state!, ...(item.sha ? { head: item.sha } : {}) } : { state: current.labels.state! }
     const overrides: SyncOverrides = { labels: { ...event.labels, ...state }, root: () => ({ text: current.text, labels: current.labels }) }
     if (event.type === 'mr.synchronized') return { ...overrides, labels: { ...overrides.labels, ...headFailure(project, item) } }
@@ -307,8 +308,13 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
     return { ...overrides, text: `pipeline ${pipeline.status} on ${item.references?.full ?? `!${item.iid}`} at ${pipeline.sha.slice(0, 8)}: ${pipeline.url}` }
   }
 
-  const confidential = async (project: string, kind: Kind, iid: string, item?: Noteable) =>
-    kind === 'issue' && (item ?? (await noteableOf(project, kind, iid))).confidential === true
+  const hiddenIssue = async (event: string, hook: Hook): Promise<[DropReason] | null> => {
+    const iid = hook.issue?.iid ?? (event === 'Issue Hook' ? hook.object_attributes?.iid : undefined)
+    if (typeof iid !== 'number' || typeof hook.project?.id !== 'number') return null
+    const issue = await noteableOf(String(hook.project.id), 'issue', String(iid)).catch(() => null)
+    if (issue === null) return ['unreadable_project']
+    return issue.confidential === true ? ['confidential'] : null
+  }
 
   const sync: SyncFn<ChatSdkEvent<'gitlab'>> = async (sync) => {
     if (sync.direction === 'out') {
@@ -324,12 +330,9 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
     if (event.kind !== 'message' && event.kind !== 'lifecycle') return void (await sync.import())
     const [project, kind, iid] = native(sync.key, event.thread).split(':') as [string, Kind, string]
     const channel = gitlabChannel(await pathOf(project))
-    if (event.kind === 'message') {
-      if (await confidential(project, kind, iid)) return drops.record('gitlab', 'confidential')
-      return void (await sync.import(channel))
-    }
+    if (event.kind === 'message') return void (await sync.import(channel))
     const item = await noteableOf(project, kind, iid)
-    if (await confidential(project, kind, iid, item)) return drops.record('gitlab', 'confidential')
+    if (item.confidential === true) return drops.record('gitlab', 'confidential')
     const overrides = await reconciled(event, project, kind, item, event.raw as Kept)
     if (overrides) await sync.import(channel, overrides)
   }
@@ -342,7 +345,9 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
       intercept: lifecycleEvents,
       fetchRoot: async (thread) => {
         const [project, kind, iid] = thread.split(':') as [string, Kind, string]
-        return rootOf(kind, await noteableOf(project, kind, iid))
+        const root = rootOf(project, kind, await noteableOf(project, kind, iid))
+        if (kind === 'issue' || !(await approvedOf(project, iid))) return root
+        return { ...root, labels: { ...root.labels, review: 'approved' } }
       },
     },
     sync,
@@ -355,7 +360,7 @@ export function gitlab(options: GitLabSync, drops: Drops, threadRoot: (message: 
       return receive(key, request, keptOnly(emit))
     }
     const hook = parsed(await request.clone().text())
-    const dropped = hook ? await exclusion(hook) : null
+    const dropped = hook ? ((await exclusion(hook)) ?? (await hiddenIssue(request.headers.get('x-gitlab-event') ?? '', hook))) : null
     if (dropped) {
       drops.record('gitlab', ...dropped)
       return new Response('ok')

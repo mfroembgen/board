@@ -18,7 +18,7 @@ function mergeRequestItem(iid: number, extra: Record<string, unknown> = {}) {
     state: 'opened',
     draft: false,
     sha: 'a1b2c3d4e5f6a7b8',
-    head_pipeline: { id: 300, status: 'failed', sha: 'a1b2c3d4e5f6a7b8' },
+    head_pipeline: { id: 300, status: 'running', sha: 'a1b2c3d4e5f6a7b8' },
     web_url: `${MR_URL}/${iid}`,
     references: { full: `acme/platform/web!${iid}` },
     author: { id: 6, username: 'bo', name: 'Bo' },
@@ -355,13 +355,14 @@ test('a failure of the head pipeline labels and replies; a superseded run, or on
   const mr = '/projects/42/merge_requests/7'
   await gitlabHook(app, 'Merge Request Hook', mergeRequest('open'))
   const root = await mergeRequestRoot(app)
+  setItem(mr, { head_pipeline: { id: 300, status: 'failed', sha: 'a1b2c3d4e5f6a7b8' } })
   await gitlabHook(app, 'Pipeline Hook', pipeline(299, 'canceled'))
   await gitlabHook(app, 'Pipeline Hook', pipeline(300, 'canceled'))
   await gitlabHook(app, 'Pipeline Hook', pipeline(300, 'failed'))
   const failed = await until(app, root.id, ({ message }) => message.labels['ci.42-7.pipeline'] === 'failed')
   assert.deepEqual(repliesOf(failed), [`pipeline failed on acme/platform/web!7 at a1b2c3d4: https://gitlab.test/acme/platform/web/-/pipelines/300`])
 
-  setItem(mr, { head_pipeline: { id: 300, status: 'success' } })
+  setItem(mr, { head_pipeline: { id: 300, status: 'success', sha: 'a1b2c3d4e5f6a7b8' } })
   await gitlabHook(app, 'Pipeline Hook', pipeline(300, 'success'))
   await until(app, root.id, ({ message }) => message.labels['ci.42-7.pipeline'] === undefined)
   await gitlabHook(app, 'Pipeline Hook', pipeline(300, 'failed'))
@@ -413,6 +414,7 @@ test('a new commit on a merge request moves its head and clears its pipeline lab
   const app = board({ gitlab: gitlabSync() })
   await gitlabHook(app, 'Merge Request Hook', mergeRequest('open'))
   const root = await mergeRequestRoot(app)
+  setItem('/projects/42/merge_requests/7', { head_pipeline: { id: 300, status: 'failed', sha: 'a1b2c3d4e5f6a7b8' } })
   await gitlabHook(app, 'Pipeline Hook', pipeline(300, 'failed'))
   await until(app, root.id, ({ message }) => message.labels['ci.42-7.pipeline'] === 'failed')
   setItem('/projects/42/merge_requests/7', { sha: 'b2c3d4e5f6a7b8c9', head_pipeline: { id: 301, status: 'running', sha: 'b2c3d4e5f6a7b8c9' } })
@@ -459,6 +461,7 @@ test('an issue or merge request from before the sync gets its root from GitLab w
   assert.equal(closed.labels.state, 'closed')
   assert.deepEqual(repliesOf(await until(app, closed.id, ({ replies }) => replies.length === 1)), ['closed by bo'])
 
+  setItem('/projects/42/merge_requests/7', { head_pipeline: { id: 300, status: 'failed', sha: 'a1b2c3d4e5f6a7b8' } })
   await gitlabHook(app, 'Pipeline Hook', pipeline(300, 'failed'))
   const root = await mergeRequestRoot(app)
   assert.equal(root.text, `MR !7: Ship the export page\n${MR_URL}/7`)
@@ -480,6 +483,30 @@ test('a confidential issue stays off the board, even from an event sent before i
   await mergeRequestRoot(app)
   await eventually(async () => (logged.filter((line) => line === '[board] gitlab dropped: confidential').length === 2 ? true : undefined))
   assert.ok(!JSON.stringify(await channel(app, 'gitlab/platform')).includes('Layoffs'))
+})
+
+test('a comment that first brings an approved merge request with a failing head onto the board says both', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  setItem('/projects/42/merge_requests/7', { head_pipeline: { id: 300, status: 'failed', sha: 'a1b2c3d4e5f6a7b8' } })
+  setItem('/projects/42/merge_requests/7/approvals', { approved: true })
+  await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
+  const root = await mergeRequestRoot(app)
+  assert.equal(root.labels.review, 'approved')
+  assert.equal(root.labels['ci.42-7.pipeline'], 'failed')
+})
+
+test('an issue comment is checked against GitLab before it is stored, and a project moved since the webhook left is too', async () => {
+  const app = board({ gitlab: gitlabSync(['acme/hiring']) })
+  const onIssue = { ...note(1003, 'd3', 'see the plan'), merge_request: undefined, issue: { id: 901, iid: 3, title: 'Export page is blank' } }
+  setItem('/projects/42/issues/3', { confidential: true })
+  await gitlabHook(app, 'Note Hook', onIssue)
+  setItem('/projects/42/issues/3', { confidential: false })
+  api['/projects/42'] = { ...(api['/projects/42'] as object), path_with_namespace: 'acme/hiring/web' }
+  await gitlabHook(app, 'Note Hook', onIssue)
+  assert.deepEqual(await inbox(app, 'gitlab'), [])
+  const metrics = await (await app(new Request('https://board.test/metrics'))).text()
+  assert.match(metrics, /^board_sync_dropped_total\{entry="gitlab",reason="confidential"\} 1$/m)
+  assert.match(metrics, /^board_sync_dropped_total\{entry="gitlab",reason="excluded_path"\} 1$/m)
 })
 
 test('a merge request whose target moved into an excluded group is dropped at once, however recently its old path was seen', async () => {
