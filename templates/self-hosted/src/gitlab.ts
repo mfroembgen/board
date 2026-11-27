@@ -112,7 +112,8 @@ function rootOf(project: number | string, kind: Kind, item: Noteable): Omit<Sync
     return { text: `MR !${item.iid}: ${item.title}\n${item.web_url}`, labels, author }
   }
   const labels = { issue: item.references?.full ?? '', state: item.state === 'closed' ? 'closed' : 'open' }
-  return { text: `Issue #${item.iid}: ${item.title}\n${item.web_url}`, labels, author }
+  const title = item.confidential === true ? '(confidential)' : item.title
+  return { text: `Issue #${item.iid}: ${title}\n${item.web_url}`, labels, author }
 }
 
 function mergeRequestChanges(hook: Hook, project: number): Change[] {

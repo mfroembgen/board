@@ -109,6 +109,11 @@ function note(id: number, discussion: string, text: string, options: { path?: st
   }
 }
 
+function issueNote(id: number, discussion: string, text: string) {
+  const comment = note(id, discussion, text)
+  return { ...comment, object_attributes: { ...comment.object_attributes, noteable_type: 'Issue' }, merge_request: undefined, issue: { id: 901, iid: 3, title: 'Export page is blank' } }
+}
+
 function mergeRequest(action: string, extra: { by?: string; iid?: number; oldrev?: string; changes?: object; path?: string; source?: string; state?: string } = {}) {
   const iid = extra.iid ?? 7
   const path = extra.path ?? 'acme/platform/web'
@@ -479,7 +484,7 @@ test('a confidential issue stays off the board, even from an event sent before i
   const app = board({ gitlab: gitlabSync() })
   setItem('/projects/42/issues/3', { confidential: true, title: 'Layoffs in the platform team' })
   await gitlabHook(app, 'Issue Hook', issue('close', 'bo'))
-  await gitlabHook(app, 'Note Hook', { ...note(1003, 'd3', 'see the plan'), object_attributes: { ...note(1003, 'd3', 'see the plan').object_attributes, noteable_type: 'Issue' }, merge_request: undefined, issue: { id: 901, iid: 3, title: 'Export page is blank' } })
+  await gitlabHook(app, 'Note Hook', issueNote(1003, 'd3', 'see the plan'))
   await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
   await mergeRequestRoot(app)
   await eventually(async () => (logged.filter((line) => line === '[board] gitlab dropped: confidential').length === 2 ? true : undefined))
@@ -498,7 +503,7 @@ test('a comment that first brings an approved merge request with a failing head 
 
 test('an issue comment is checked against GitLab before it is stored, and a project moved since the webhook left is too', async () => {
   const app = board({ gitlab: gitlabSync(['acme/hiring']) })
-  const onIssue = { ...note(1003, 'd3', 'see the plan'), merge_request: undefined, issue: { id: 901, iid: 3, title: 'Export page is blank' } }
+  const onIssue = issueNote(1003, 'd3', 'see the plan')
   setItem('/projects/42/issues/3', { confidential: true })
   await gitlabHook(app, 'Note Hook', onIssue)
   setItem('/projects/42/issues/3', { confidential: false })
@@ -513,15 +518,27 @@ test('an issue comment is checked against GitLab before it is stored, and a proj
 test('a webhook whose issue turns confidential, or whose project moves into an excluded group, while it waits in the inbox stays off the board', async () => {
   const app = board({ gitlab: gitlabSync(['acme/hiring']) })
   const reads = { project: 0, issue: 0 }
+  const loggedSince = (start: number, line: string) => async () => (logged.slice(start).includes(line) ? true : undefined)
+  const start = logged.length
   api['/projects/42'] = () => projectOf(42, reads.project++ === 0 ? 'acme/platform/web' : 'acme/hiring/web')
   await gitlabHook(app, 'Note Hook', note(1001, 'd1', 'looks good'))
-  await eventually(async () => (logged.includes('[board] gitlab dropped: excluded path acme/hiring') ? true : undefined))
+  await eventually(loggedSince(start, '[board] gitlab dropped: excluded path acme/hiring'))
 
+  const before = logged.length
   api['/projects/42'] = projectOf(42, 'acme/platform/web')
   api['/projects/42/issues/3'] = () => issueItem({ confidential: reads.issue++ > 0 })
-  await gitlabHook(app, 'Note Hook', { ...note(1003, 'd3', 'see the plan'), merge_request: undefined, issue: { id: 901, iid: 3, title: 'Export page is blank' } })
-  await eventually(async () => (logged.includes('[board] gitlab dropped: confidential') ? true : undefined))
+  await gitlabHook(app, 'Note Hook', issueNote(1003, 'd3', 'see the plan'))
+  await eventually(loggedSince(before, '[board] gitlab dropped: confidential'))
   assert.deepEqual(await channel(app, 'gitlab/platform'), [])
+})
+
+test('a root GitLab returns for an issue that has turned confidential names no title', async () => {
+  const app = board({ gitlab: gitlabSync() })
+  const reads = { issue: 0 }
+  api['/projects/42/issues/3'] = () => issueItem(++reads.issue <= 2 ? {} : { confidential: true, title: 'Layoffs in the platform team' })
+  await gitlabHook(app, 'Note Hook', issueNote(1003, 'd3', 'see the plan'))
+  const root = await eventually(async () => (await channel(app, 'gitlab/platform')).find((message) => message.re === null))
+  assert.equal(root.text, 'Issue #3: (confidential)\nhttps://gitlab.test/acme/platform/web/-/issues/3')
 })
 
 test('a merge request whose target moved into an excluded group is dropped at once, however recently its old path was seen', async () => {
